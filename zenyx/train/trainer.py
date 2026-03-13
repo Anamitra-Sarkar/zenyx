@@ -328,10 +328,21 @@ class Trainer:
         # --- Step 17: Phase 7 — KV Cache Tiering ---
         if kv_tier_config is not None:
             from zenyx.train.kv_cache_tier import BeladyKVCacheManager
+            # Infer num_layers the same way Step 20 does.
+            num_layers_kv = 2  # default for tiny models
+            for _attr in ("layers", "blocks", "encoder", "decoder"):
+                _layers_attr = getattr(model, _attr, None)
+                if _layers_attr is not None and hasattr(_layers_attr, "__len__"):
+                    num_layers_kv = len(_layers_attr)
+                    break
+            # Infer ring_degree from topology if available.
+            ring_degree_kv = max(1, self._topo_info.world_size) if hasattr(self, "_topo_info") else 1
+            cfg = kv_tier_config if isinstance(kv_tier_config, dict) else {}
             self._kv_cache_manager = BeladyKVCacheManager(
-                world_size=self._topo_info.world_size
-                if hasattr(self, "_topo_info") else 1,
-                **kv_tier_config if isinstance(kv_tier_config, dict) else {},
+                world_size=cfg.get("world_size", self._topo_info.world_size if hasattr(self, "_topo_info") else 1),
+                num_layers=cfg.get("num_layers", num_layers_kv),
+                ring_degree=cfg.get("ring_degree", ring_degree_kv),
+                **{k: v for k, v in cfg.items() if k not in ("world_size", "num_layers", "ring_degree")},
             )
             logger.info("Phase 7: BeladyKVCacheManager initialized")
 
