@@ -19,6 +19,14 @@ def test_no_weights_only_false_in_checkpoint() -> None:
         "checkpoint.py contains weights_only=False — this is a security risk "
         "for PyTorch >= 2.5. Use weights_only=True."
     )
+    # checkpoint.py currently uses raw numpy bytes — no torch.load.
+    # If torch.load is ever added, the assertion below enforces
+    # weights_only=True is present. This is a no-op today.
+    if "torch.load" in content:
+        assert "weights_only=True" in content, (
+            "checkpoint.py contains torch.load without "
+            "weights_only=True — this is a security risk in PyTorch >= 2.5."
+        )
 
 
 def test_no_weights_only_false_in_trainer() -> None:
