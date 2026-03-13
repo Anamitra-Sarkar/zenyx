@@ -1,4 +1,9 @@
-"""Main training entrypoint — ``zenyx.train()`` and ``zenyx.wrap()``.
+"""Legacy (Phase 2) training entrypoint — internal use only.
+
+.. note::
+    This module is retained for backward compatibility.  The public training
+    API is :func:`zenyx.train.trainer.train` (Phase 4).  Do **not** import
+    ``train`` from this module — it has been renamed to ``_legacy_train``.
 
 Workflow
 --------
@@ -30,7 +35,6 @@ from zenyx.train.mixed_prec import FP8ActivationStorage, fp8_checkpoint
 from zenyx.train.pipeline import BraidedPipeline
 
 __all__ = [
-    "train",
     "wrap",
 ]
 
@@ -281,7 +285,7 @@ def wrap(
 # ---------------------------------------------------------------------------
 
 
-def train(
+def _legacy_train(
     model: nn.Module,
     dataloader: DataLoader[Any],
     *,
@@ -294,7 +298,7 @@ def train(
     checkpoint_every: int = _DEFAULT_CHECKPOINT_EVERY,
     fp8_every_n: int = 4,
 ) -> Dict[str, Any]:
-    """Zenyx main training entrypoint.
+    """Legacy Phase 2 training entrypoint (internal use only).
 
     Users call ``zenyx.train(model, dataloader)`` — everything else is
     auto-detected.  **Never raises** ``torch.cuda.OutOfMemoryError``.
