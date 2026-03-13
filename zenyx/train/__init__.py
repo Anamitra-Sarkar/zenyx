@@ -95,12 +95,33 @@ __all__ = [
 ]
 
 
+# ---------------------------------------------------------------------------
 # Legacy submodule — wrap() from loop.py moved here for backward compat
+# ---------------------------------------------------------------------------
+
 class legacy:  # noqa: N801
     """Legacy training functions from loop.py (deprecated)."""
 
     @staticmethod
     def wrap(*args, **kwargs):  # type: ignore[no-untyped-def]
-        """Deprecated. Use zenyx.train.trainer.Trainer instead."""
+        """Deprecated. Use zenyx.train.trainer.Trainer instead.
+
+        Call-stack when user calls zenyx.train.legacy.wrap(model):
+          Frame 0: warnings.warn() here          (stacklevel=2 → frame 2)
+          Frame 1: legacy.wrap() body            (this frame)
+          Frame 2: user code                     ← warning correctly points here
+
+        The inner loop.wrap() DeprecationWarning is suppressed so callers
+        receive exactly one warning, attributed to their own call site.
+        """
+        import warnings as _warnings
+        _warnings.warn(
+            "zenyx.train.legacy.wrap() is deprecated. "
+            "Use zenyx.train.trainer.Trainer instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         from zenyx.train.loop import wrap as _legacy_wrap
-        return _legacy_wrap(*args, **kwargs)
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore", DeprecationWarning)
+            return _legacy_wrap(*args, **kwargs)
