@@ -20,6 +20,13 @@ Fix notes
   state, and step counter. It now loads the full state dict from disk first
   via torch.load and restores all state, then calls loader.load() to populate
   the model weights efficiently.
+* throughput_estimate: was computed but never passed to the profiler. Now
+  forwarded to profiler.end_op().
+* get_state() throughput: was context_len / avg_time (single-sequence only).
+  Now multiplied by batch_size for correct global tokens/sec.
+* _compute_loss fallback: returning raw output tensor caused .backward() to
+  fail with 'grad can be implicitly created only for scalar outputs'. Now
+  always returns a scalar via .reshape(-1).mean().
 """
 
 from __future__ import annotations
@@ -48,6 +55,8 @@ __all__ = ["Trainer", "train"]
 
 logger = logging.getLogger(__name__)
 
+# One-shot flag for _compute_loss fallback warning.
+_COMPUTE_LOSS_FALLBACK_WARNED: bool = False
 
 # ---------------------------------------------------------------------------
 # Dtype mapping
@@ -335,6 +344,9 @@ class Trainer:
             batch_size=batch_size,
         )
 
+        # Cache inferred batch size for throughput computation.
+        self._batch_size: int = batch_size
+
         # --- Step 13: Resume from checkpoint ---
         if resume_from is not None:
             self._load_checkpoint(resume_from)
@@ -352,8 +364,6 @@ class Trainer:
                 pass
 
         # --- Step 15: Memory bandwidth validation [DISPUTE 7-A] ---
-        # Fix: HardwareInfo exposes bandwidth_t0_t1 in bytes/s, not hbm_bandwidth_gbs.
-        # Convert bytes/s → GB/s before calling the validation formulas.
         self.validate_memory_bandwidth()
 
         # --- Step 16: Batch size sanity check ---
@@ -373,14 +383,12 @@ class Trainer:
         # --- Step 17: Phase 7 — KV Cache Tiering ---
         if kv_tier_config is not None:
             from zenyx.train.kv_cache_tier import BeladyKVCacheManager, KVTierConfig
-            # Infer num_layers the same way Step 20 does.
-            num_layers_kv = 2  # default for tiny models
+            num_layers_kv = 2
             for _attr in ("layers", "blocks", "encoder", "decoder"):
                 _layers_attr = getattr(model, _attr, None)
                 if _layers_attr is not None and hasattr(_layers_attr, "__len__"):
                     num_layers_kv = len(_layers_attr)
                     break
-            # Infer ring_degree from topology if available.
             ring_degree_kv = max(1, self._topo_info.world_size) if hasattr(self, "_topo_info") else 1
             if isinstance(kv_tier_config, KVTierConfig):
                 cfg = vars(kv_tier_config)
@@ -434,8 +442,7 @@ class Trainer:
         # --- Step 20: Phase 10 — Sparse Ring Attention ---
         if sparse_attn:
             from zenyx.ops.attention.sparse_ring_attn import SparseRingAttentionKernel
-            # Determine num_layers from model architecture
-            num_layers = 2  # default for tiny models
+            num_layers = 2
             for attr_name in ("layers", "blocks", "encoder", "decoder"):
                 layers_attr = getattr(model, attr_name, None)
                 if layers_attr is not None and hasattr(layers_attr, "__len__"):
@@ -469,52 +476,28 @@ class Trainer:
     # ------------------------------------------------------------------
 
     def register_compute_graph(self, graph: Any) -> None:
-        """Register a compute graph for Bélády-optimal eviction scheduling.
-
-        Users can provide graph information for optimal eviction planning
-        in dynamic-routing / MoE models.
-
-        Time: O(G + N log N) where G = graph ops, N = tracked blocks.
-        Space: O(G).
-
-        Args:
-            graph: A :class:`ComputeGraph` instance.
-        """
+        """Register a compute graph for Bélády-optimal eviction scheduling."""
         self._compute_graph = graph
         if self._tier_allocator is not None:
             self._tier_allocator.register_compute_graph(graph)
             logger.info("Compute graph registered with TierAllocator")
 
     def validate_memory_bandwidth(self) -> None:
-        """Validate memory bandwidth feasibility [DISPUTE 7-A].
-
-        Runs BOTH the corrected and original feasibility formulas.
-        Emits RuntimeWarning if EITHER flags a violation.
-
-        Fix: HardwareInfo.bandwidth_t0_t1 is in bytes/s. Convert to GB/s
-        before passing to the validation formulas which expect GB/s.
-        The previous code read the non-existent field `hbm_bandwidth_gbs`,
-        always getting 0.0 and hitting the early-return guard on every run.
-
-        Source A: min(B_01, B_12) >= AI × Fcompute (corrected)
-        Source B: 1/B_01 + 1/B_12 <= 1/Fcompute (original)
-        """
+        """Validate memory bandwidth feasibility [DISPUTE 7-A]."""
         from zenyx.train.kv_cache_tier import (
             validate_bandwidth_corrected,
             validate_bandwidth_original,
         )
 
-        # bandwidth_t0_t1 is in bytes/s — convert to GB/s.
         b_01_bytes_per_s = getattr(self._hw_info, "bandwidth_t0_t1", 0.0) if hasattr(self, "_hw_info") else 0.0
-        b_01 = b_01_bytes_per_s / (1024 ** 3)  # bytes/s → GB/s
+        b_01 = b_01_bytes_per_s / (1024 ** 3)
         b_12 = 7.5  # Conservative PCIe Gen4 NVMe default (GB/s)
         compute_tflops = getattr(self._hw_info, "compute_tflops", 0.0) if hasattr(self, "_hw_info") else 0.0
 
         if b_01 <= 0 or compute_tflops <= 0:
             logger.debug(
                 "Bandwidth validation skipped (incomplete hardware info: "
-                "b_01=%.3f GB/s, compute_tflops=%.1f). "
-                "This is expected on CPU-only runs.",
+                "b_01=%.3f GB/s, compute_tflops=%.1f).",
                 b_01, compute_tflops,
             )
             return
@@ -524,7 +507,6 @@ class Trainer:
 
         corrected_ok = corrected_result[0] if isinstance(corrected_result, tuple) else corrected_result
         original_ok = original_result[0] if isinstance(original_result, tuple) else original_result
-
         corrected_msg = corrected_result[1] if isinstance(corrected_result, tuple) else ""
         original_msg = original_result[1] if isinstance(original_result, tuple) else ""
 
@@ -540,8 +522,7 @@ class Trainer:
                 f"Corrected formula: {'PASS' if corrected_ok else 'FAIL'}, "
                 f"Original formula: {'PASS' if original_ok else 'FAIL'}. "
                 f"B_01={b_01:.1f} GB/s, B_12={b_12:.1f} GB/s, "
-                f"Compute={compute_tflops:.1f} TFLOPS. "
-                f"Training may proceed in throttled-compute mode.",
+                f"Compute={compute_tflops:.1f} TFLOPS.",
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -549,8 +530,7 @@ class Trainer:
         if corrected_ok != original_ok:
             logger.critical(
                 "DISPUTE 7-A: Feasibility formulas DISAGREE. "
-                "Corrected=%s, Original=%s. "
-                "Investigate bandwidth configuration.",
+                "Corrected=%s, Original=%s.",
                 "PASS" if corrected_ok else "FAIL",
                 "PASS" if original_ok else "FAIL",
             )
@@ -560,27 +540,7 @@ class Trainer:
     # ------------------------------------------------------------------
 
     def train(self) -> None:
-        """Run the full training loop.
-
-        Algorithm:
-        1. For each batch from dataloader:
-           a. Forward pass through model
-           b. Compute loss
-           c. Scale loss by 1/gradient_accumulation_steps
-           d. Backward pass
-           e. If gradient_accumulation_steps reached:
-              - Clip gradients (grad_clip)
-              - Optimizer step
-              - LR scheduler step
-              - Zero gradients
-              - Log if log_every
-              - Checkpoint if checkpoint_every
-              - If dynamic_routing and step % heap_rebuild_interval == 0:
-                  trigger graph rebuild or controller replan
-        2. Final checkpoint save
-
-        Time: O(steps × (forward + backward + optimizer)).
-        """
+        """Run the full training loop."""
         self._model.train()
 
         accum_loss = 0.0
@@ -591,24 +551,19 @@ class Trainer:
                 break
 
             step_start = time.monotonic()
-
-            # Start profiling the training step
             _profile_handle = self._profiler.start_op("train_step")
 
-            # Unpack batch
             if isinstance(batch, (tuple, list)) and len(batch) >= 2:
                 inputs, labels = batch[0], batch[1]
             else:
                 inputs = batch
                 labels = None
 
-            # Move to device
             if hasattr(inputs, "to"):
                 inputs = inputs.to(self._device, non_blocking=True)
             if labels is not None and hasattr(labels, "to"):
                 labels = labels.to(self._device, non_blocking=True)
 
-            # Forward + loss
             if self._use_amp:
                 with torch.amp.autocast(device_type=self._backend, dtype=self._amp_dtype):
                     output = self._model(inputs)
@@ -617,17 +572,12 @@ class Trainer:
                 output = self._model(inputs)
                 loss = self._compute_loss(output, labels)
 
-            # Scale for gradient accumulation
             loss = loss / self._gradient_accumulation_steps
-
-            # Backward
             self._grad_scaler.scale(loss).backward()
             accum_loss += loss.item()
             micro_step += 1
 
-            # Optimizer step at accumulation boundary
             if micro_step % self._gradient_accumulation_steps == 0:
-                # Clip gradients
                 if self._grad_clip > 0:
                     self._grad_scaler.unscale_(self._optimizer)
                     torch.nn.utils.clip_grad_norm_(
@@ -642,34 +592,34 @@ class Trainer:
                 self._step += 1
                 self._last_loss = accum_loss * self._gradient_accumulation_steps
 
-                # Track step time
                 elapsed = time.monotonic() - step_start
                 self._recent_step_times.append(elapsed)
                 if len(self._recent_step_times) > 100:
                     self._recent_step_times = self._recent_step_times[-100:]
 
-                # Estimate throughput for profiler
-                throughput_estimate = self._context_len / elapsed if elapsed > 0 else 0.0
+                # Compute global tokens/sec (context_len * batch_size / elapsed)
+                # and pass to the profiler so it appears in profiler stats.
+                throughput_estimate = (
+                    self._context_len * self._batch_size / elapsed
+                    if elapsed > 0 else 0.0
+                )
+                self._profiler.end_op(_profile_handle, throughput=throughput_estimate)
 
-                # End profiling the training step
-                self._profiler.end_op(_profile_handle)
-
-                # Logging
                 if is_main_process() and self._step % self._log_every == 0:
                     lr = self._scheduler.get_lr()
                     logger.info(
-                        "Step %d | Loss: %.4f | LR: %.2e | Time: %.3fs",
+                        "Step %d | Loss: %.4f | LR: %.2e | Time: %.3fs | "
+                        "Throughput: %.0f tok/s",
                         self._step,
                         self._last_loss,
                         lr,
                         elapsed,
+                        throughput_estimate,
                     )
 
-                # Checkpoint
                 if self._step % self._checkpoint_every == 0:
                     self._save_checkpoint()
 
-                # Heap rebuild / controller replan for dynamic routing
                 if (
                     self._dynamic_routing
                     and self._step % self._heap_rebuild_interval == 0
@@ -683,12 +633,9 @@ class Trainer:
                             logger.debug("Heap rebuild skipped: %s", e)
                     else:
                         logger.debug(
-                            "Heap rebuild skipped: no compute graph registered "
-                            "(dynamic_routing=True). Call register_compute_graph() "
-                            "to enable Bélády-optimal eviction."
+                            "Heap rebuild skipped: no compute graph registered."
                         )
 
-                # Controller replan check (advisory, non-blocking)
                 try:
                     new_plan = self._controller.step(
                         step_num=self._step,
@@ -707,12 +654,10 @@ class Trainer:
 
                 accum_loss = 0.0
 
-        # Final checkpoint
         if is_main_process():
             self._save_checkpoint()
             logger.info("Training complete at step %d", self._step)
 
-        # Shutdown profiler
         self._profiler.shutdown()
 
     # ------------------------------------------------------------------
@@ -722,24 +667,16 @@ class Trainer:
     def get_state(self) -> dict:
         """Return training state snapshot for monitoring.
 
-        Returns dict with:
-        - step: current step number
-        - loss: last logged loss
-        - lr: current learning rate
-        - memory_usage: pool.usage() snapshot
-        - topology: topo info
-        - throughput_tokens_per_sec: computed from recent steps
-        - parallelism_plan: current parallelism plan
-        - profiler_stats: profiler timing stats
-
-        Time: O(K) where K = profiled ops.  Space: O(K).
+        throughput_tokens_per_sec reflects global tokens/sec:
+            context_len * batch_size / avg_step_time
         """
         throughput = 0.0
         if self._recent_step_times:
             avg_time = sum(self._recent_step_times) / len(self._recent_step_times)
             if avg_time > 0:
-                # Estimate tokens/sec based on context_len and batch
-                throughput = self._context_len / avg_time
+                # Multiply by batch_size so the value is global tokens/sec,
+                # not single-sequence tokens/sec.
+                throughput = self._context_len * self._batch_size / avg_time
 
         pool_usage: Optional[dict] = None
         if self._tier_allocator is not None:
@@ -750,7 +687,6 @@ class Trainer:
                 except Exception:
                     pass
 
-        # Profiler stats
         profiler_stats: Optional[dict] = None
         try:
             timings = self._profiler.get_timings()
@@ -761,7 +697,6 @@ class Trainer:
         except Exception:
             pass
 
-        # Parallelism plan
         plan_dict: Optional[dict] = None
         if self._parallelism_plan is not None:
             plan_dict = {
@@ -793,14 +728,6 @@ class Trainer:
     # ------------------------------------------------------------------
 
     def _infer_vocab_size(self) -> int:
-        """Try to infer vocabulary size from model attributes.
-
-        Note: falls back to 32000 (LLaMA vocabulary) if not detectable.
-        This is a heuristic — models with different vocab sizes should
-        expose a .config.vocab_size attribute.
-
-        Time: O(1).
-        """
         for attr in ("config", "cfg"):
             cfg = getattr(self._model, attr, None)
             if cfg is not None:
@@ -808,13 +735,9 @@ class Trainer:
                     val = getattr(cfg, key, None)
                     if val is not None:
                         return int(val)
-        return 32000  # LLaMA default; may be wrong for other architectures
+        return 32000
 
     def _infer_batch_size(self) -> int:
-        """Try to infer batch size from the dataloader.
-
-        Time: O(1).
-        """
         bs = getattr(self._dataloader, "batch_size", None)
         if bs is not None:
             return int(bs)
@@ -823,22 +746,35 @@ class Trainer:
     def _compute_loss(
         self, output: torch.Tensor, labels: Optional[torch.Tensor]
     ) -> torch.Tensor:
-        """Compute loss from model output and labels."""
+        """Compute loss from model output and labels.
+
+        Falls back to output.reshape(-1).mean() when no labels are provided.
+        Always returns a scalar tensor so .backward() does not raise
+        'grad can be implicitly created only for scalar outputs'.
+        """
+        global _COMPUTE_LOSS_FALLBACK_WARNED
+
         if labels is not None and not self._use_vocab_parallel:
-            # Standard CrossEntropyLoss path
             if output.dim() == 3:
                 B, S, V = output.shape
                 output = output.view(B * S, V)
                 labels = labels.view(B * S)
             return self._loss_fn(output.float(), labels)
 
-        # Fallback: mean of output as loss (for testing)
-        if hasattr(output, "mean"):
-            return output.float().mean()
-        return output
+        # Fallback scalar loss for testing / no-label scenarios.
+        # Always reduce to a scalar so .backward() succeeds.
+        if not _COMPUTE_LOSS_FALLBACK_WARNED:
+            warnings.warn(
+                "_compute_loss: no labels provided. Falling back to "
+                "output.reshape(-1).mean() as a proxy scalar loss. "
+                "Gradients carry no learning signal. Pass labelled batches.",
+                UserWarning,
+                stacklevel=3,
+            )
+            _COMPUTE_LOSS_FALLBACK_WARNED = True
+        return output.float().reshape(-1).mean()
 
     def _save_checkpoint(self) -> None:
-        """Save a checkpoint to disk."""
         if not is_main_process():
             return
 
@@ -858,19 +794,7 @@ class Trainer:
             logger.warning("Checkpoint save failed: %s", e)
 
     def _load_checkpoint(self, path: str) -> None:
-        """Load a checkpoint from disk.
-
-        Fix: when loader_config is set, the previous code only restored model
-        weights via ModelLoader and silently dropped optimizer state, scheduler
-        state, and the step counter. Now the full state dict is loaded from
-        disk first (torch.load), all non-weight state is restored, and then
-        loader.load() is called to populate model weights via the fast
-        triple-buffered path.
-
-        If a loader_config is set, uses the fast ModelLoader for triple-buffered
-        weight loading. Otherwise falls back to standard torch.load for weights.
-        In both cases, optimizer, scheduler, and step state are always restored.
-        """
+        """Load a checkpoint from disk."""
         if not os.path.exists(path):
             logger.warning("Checkpoint not found: %s", path)
             return
@@ -879,15 +803,10 @@ class Trainer:
             if self._loader_config is not None:
                 from zenyx.loader.loader import ModelLoader
 
-                # Load the full state dict from disk to restore all training state.
-                # weights_only=False is required here because optimizer state dicts
-                # contain non-tensor objects (e.g. param groups with Python ints/floats).
-                # The file is assumed to be a trusted Zenyx checkpoint.
                 full_state = torch.load(
                     path, map_location=self._device, weights_only=False
                 )
 
-                # Restore non-weight state first.
                 self._optimizer.load_state_dict(full_state["optimizer_state_dict"])
                 self._step = full_state.get("step", 0)
                 if "scheduler_state" in full_state:
@@ -900,7 +819,6 @@ class Trainer:
                     for _ in range(full_state["scheduler_step"]):
                         self._scheduler.step()
 
-                # Now use the fast loader for the model weights (triple-buffered).
                 loader = ModelLoader(
                     hal=self._hal,
                     hw_info=self._hw_info,
@@ -919,16 +837,12 @@ class Trainer:
                 self._model.load_state_dict(state["model_state_dict"])
                 self._optimizer.load_state_dict(state["optimizer_state_dict"])
                 self._step = state.get("step", 0)
-                # Restore scheduler state faithfully.
                 if "scheduler_state" in state:
                     self._scheduler.load_state_dict(state["scheduler_state"])
                 elif "scheduler_step" in state:
-                    # Backward compat: old checkpoint format without full
-                    # scheduler state — fall back to the loop method.
                     logger.warning(
                         "Old checkpoint format detected (scheduler_step). "
-                        "Falling back to step-loop scheduler restore. "
-                        "Re-save this checkpoint to upgrade the format."
+                        "Falling back to step-loop scheduler restore."
                     )
                     for _ in range(state["scheduler_step"]):
                         self._scheduler.step()
@@ -947,14 +861,7 @@ def train(
     dataloader: Any,
     **kwargs: Any,
 ) -> Trainer:
-    """One-line training entrypoint.
-
-    Creates a Trainer with the given model and dataloader, starts training,
-    and returns the Trainer for inspection.
-
-    Example:
-        trainer = zenyx.train(model, dataloader, context_len=131072)
-    """
+    """One-line training entrypoint."""
     trainer = Trainer(model, dataloader, **kwargs)
     trainer.train()
     return trainer
