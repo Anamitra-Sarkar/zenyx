@@ -76,7 +76,8 @@ class CosineWithWarmup:
         """Compute the learning rate for the given step.
 
         Warmup: lr = peak_lr * (step / warmup_steps)
-        Cosine: lr = min_lr + 0.5 * (peak_lr - min_lr) * (1 + cos(π * (step - warmup_steps) / (total_steps - warmup_steps)))
+        Cosine: lr = min_lr + 0.5 * (peak_lr - min_lr) * (1 + cos(π * progress))
+        where progress = (step - warmup_steps) / (total_steps - warmup_steps)
         """
         if step <= 0:
             return 0.0

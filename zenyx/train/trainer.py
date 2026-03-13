@@ -230,16 +230,16 @@ class Trainer:
             self._load_checkpoint(resume_from)
 
         # --- Step 13: Loss function ---
-        self._loss_fn: Any = None
+        self._loss_fn: Any = nn.CrossEntropyLoss()
+        self._use_vocab_parallel = False
         if get_world_size() > 1:
             try:
                 from zenyx.ops.vocab.vocab_parallel import VocabParallelCrossEntropy
                 self._loss_fn = VocabParallelCrossEntropy
+                self._use_vocab_parallel = True
                 logger.info("Using VocabParallelCrossEntropy for distributed loss")
             except ImportError:
-                self._loss_fn = nn.CrossEntropyLoss()
-        else:
-            self._loss_fn = nn.CrossEntropyLoss()
+                pass
 
         logger.info(
             "Zenyx Trainer initialized. Hardware: %s. Attention: %s. Pool: %s",
@@ -317,8 +317,8 @@ class Trainer:
             if micro_step % self._gradient_accumulation_steps == 0:
                 # Clip gradients
                 if self._grad_clip > 0:
-                    if self._grad_scaler._enabled:
-                        self._grad_scaler._scaler.unscale_(self._optimizer) if self._grad_scaler._scaler else None
+                    if self._grad_scaler._enabled and self._grad_scaler._scaler is not None:
+                        self._grad_scaler._scaler.unscale_(self._optimizer)
                     torch.nn.utils.clip_grad_norm_(
                         self._model.parameters(), self._grad_clip
                     )
@@ -421,8 +421,8 @@ class Trainer:
         self, output: torch.Tensor, labels: Optional[torch.Tensor]
     ) -> torch.Tensor:
         """Compute loss from model output and labels."""
-        if labels is not None and isinstance(self._loss_fn, nn.CrossEntropyLoss):
-            # Reshape for cross-entropy: (B*S, V) vs (B*S,)
+        if labels is not None and not self._use_vocab_parallel:
+            # Standard CrossEntropyLoss path
             if output.dim() == 3:
                 B, S, V = output.shape
                 output = output.view(B * S, V)
