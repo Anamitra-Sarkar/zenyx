@@ -175,6 +175,11 @@ class _HeapEntry:
 
     Sorted by NEGATIVE next-use time so the block with the FARTHEST next use
     is evicted first (max-heap via negative keys in a min-heap).
+
+    Used by BeladyKVCacheManager._t0_heap (a heapq list).  The heap is
+    maintained incrementally: one push per insert into T0, one heappop per
+    eviction.  This gives O(log N) eviction instead of the previous O(N)
+    linear scan.
     """
 
     __slots__ = ("next_use", "block_id", "layer_idx")
@@ -210,6 +215,11 @@ class BeladyKVCacheManager:
     Bélády eviction key for block b at time t = min(next_forward_use(b, t),
     next_backward_use(b, t)) computed over the combined timeline built offline
     before the first ring step.
+
+    Eviction complexity: O(log N) per evict using an incremental heapq
+    max-heap (negated keys).  The heap is updated on every T0 insert and
+    every eviction.  Stale entries (blocks no longer in T0) are lazily
+    skipped during heappop.
 
     Parameters
     ----------
@@ -256,8 +266,15 @@ class BeladyKVCacheManager:
         # T0 current usage in bytes
         self._t0_used: int = 0
 
-        # T0 contents set for fast membership checks
+        # T0 contents set for fast membership checks and lazy-eviction guard
         self._t0_blocks: set[Tuple[int, int]] = set()
+
+        # Bélády max-heap for O(log N) eviction.
+        # Each entry is a _HeapEntry(next_use, block_id, layer_idx).
+        # Heap ordering: smallest (-next_use) at top → block with farthest
+        # future use is popped first.  Stale entries (block already evicted
+        # from T0) are discarded lazily during heappop.
+        self._t0_heap: List[_HeapEntry] = []
 
         # Bélády heap entries: indexed by (layer, block_id) → next_use time
         self._next_use: Dict[Tuple[int, int], int] = {}
@@ -379,6 +396,11 @@ class BeladyKVCacheManager:
         for key in self._block_access_times:
             self._block_tier[key] = 2
 
+        # Reset heap — schedule has changed
+        self._t0_heap = []
+        self._t0_blocks.clear()
+        self._t0_used = 0
+
         self._schedule_built = True
         logger.info(
             "Access schedule built: %d total accesses, %d unique blocks, "
@@ -412,6 +434,17 @@ class BeladyKVCacheManager:
         if lo < len(times):
             return times[lo]
         return 10**9  # No future access — highest eviction priority
+
+    def _push_to_heap(self, key: Tuple[int, int], current_time: int) -> None:
+        """Push a newly-promoted T0 block onto the Bélády max-heap.
+
+        Called exactly once per block insert into T0.
+        Complexity: O(log N).
+        """
+        layer_idx, block_id = key
+        next_use = self._get_next_use(layer_idx, block_id, current_time)
+        entry = _HeapEntry(next_use=next_use, block_id=block_id, layer_idx=layer_idx)
+        heapq.heappush(self._t0_heap, entry)
 
     def prefetch(
         self,
@@ -461,10 +494,11 @@ class BeladyKVCacheManager:
         while self._t0_used + self._block_bytes > self.t0_budget_bytes:
             self._evict_from_t0(current_time)
 
-        # Move block to T0
+        # Move block to T0 and push onto heap
         self._block_tier[key] = 0
         self._t0_blocks.add(key)
         self._t0_used += self._block_bytes
+        self._push_to_heap(key, current_time)
 
     def evict(self, layer_idx: int, ring_step: int) -> None:
         """Evict the block with the farthest next-use from T0 using Bélády.
@@ -477,25 +511,29 @@ class BeladyKVCacheManager:
     def _evict_from_t0(self, current_time: int) -> None:
         """Evict the Bélády-optimal block from T0.
 
-        The block with the farthest next use in the combined timeline is evicted.
+        Uses the incremental max-heap (_t0_heap) for O(log N) eviction.
+        Stale entries (blocks no longer in T0, e.g. already evicted) are
+        lazily skipped: we pop until we find a key that is still in _t0_blocks.
+
+        Bélády invariant preserved: the heap orders blocks by descending
+        next_use (max-heap via negation), so the first live entry is always
+        the block whose next use is farthest in the future — exactly Bélády-
+        optimal.
         """
         if not self._t0_blocks:
             return
 
-        # Find block in T0 with max next-use time (Bélády: evict farthest future use)
-        best_key: Optional[Tuple[int, int]] = None
-        best_next_use = -1
-
-        for key in self._t0_blocks:
-            next_use = self._get_next_use(key[0], key[1], current_time)
-            if next_use > best_next_use:
-                best_next_use = next_use
-                best_key = key
-
-        if best_key is not None:
-            self._t0_blocks.discard(best_key)
-            self._block_tier[best_key] = 1  # Demote to T1
+        while self._t0_heap:
+            entry = heapq.heappop(self._t0_heap)
+            key = (entry.layer_idx, entry.block_id)
+            if key not in self._t0_blocks:
+                # Stale entry — block was already evicted; skip
+                continue
+            # Found a live T0 block: evict it
+            self._t0_blocks.discard(key)
+            self._block_tier[key] = 1  # Demote to T1
             self._t0_used -= self._block_bytes
+            return
 
     def get_block(
         self,
