@@ -117,6 +117,15 @@ def compute_reshard_cost_optimistic(
 
     1M tokens × 4096 hidden_dim × 2 bytes = 8.192 GB → 20.48 ms at 400 GB/s.
 
+    Invariant: opt < pess when called with the same seq_len and ici_bandwidth_gbs
+    (all other params at defaults).  Proof:
+      opt_payload  = seq_len × hidden_dim × bytes_per_element
+                   = seq_len × 4096 × 2   (defaults)
+      pess_payload = seq_len × bytes_per_token_per_layer × num_layers
+                   = seq_len × 4096 × 126 (defaults)
+      ratio = pess_payload / opt_payload = 126 / 2 = 63  > 1  ∀ seq_len > 0
+    Therefore opt < pess is guaranteed for all valid positive inputs at defaults.
+
     Returns
     -------
     float
@@ -137,6 +146,13 @@ def compute_reshard_cost_pessimistic(
     """Source B estimate: full KV cache + activations must transfer.
 
     1M tokens × 4096 bytes/token/layer × 126 layers = 516 GB → ~1.29 s at 400 GB/s.
+
+    Invariant: pess > opt when called with the same seq_len and ici_bandwidth_gbs
+    (all other params at defaults).  Proof:
+      pess_payload = seq_len × 4096 × 126 (defaults)
+      opt_payload  = seq_len × 4096 × 2   (defaults)
+      ratio = pess / opt = 126 / 2 = 63  > 1  ∀ seq_len > 0
+    Therefore pess > opt is guaranteed for all valid positive inputs at defaults.
 
     Returns
     -------
