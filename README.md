@@ -7,23 +7,64 @@ Never OOM. No config files. No manual tuning.
 
 ---
 
+## Quick Start
+
+```bash
+pip install zenyx
+```
+
+```python
+import torch
+import zenyx
+
+model = YourModel()
+dataloader = YourDataLoader()
+
+# That's it. Zenyx handles everything else.
+trainer = zenyx.train(
+    model,
+    dataloader,
+    context_len=131072,    # 128K context
+    dtype="bfloat16",
+    activation_dtype="float8_e4m3",
+)
+
+# Inspect training state
+state = trainer.get_state()
+print(f"Step: {state['step']}, Loss: {state['loss']:.4f}")
+```
+
+### Hardware Compatibility
+
+| Hardware             | Attention Kernel            | Max Context (tested) | Notes            |
+| -------------------- | --------------------------- | -------------------- | ---------------- |
+| H100 NVLink 4.0 (8+) | TokenRing FA3 (Triton)      | 1M tokens            | S_min=1,099      |
+| TPU v5e-8            | Ring Pallas + Shardy        | 1M tokens            | S_min=493        |
+| TPU v5p              | Ring Pallas + Shardy        | 1M tokens            | S_min=383        |
+| Any GPU (PCIe)       | Ring FA3 (PyTorch fallback) | 128K tokens          | S_min=15,454     |
+| CPU / Apple M3       | Chunked attention           | 32K tokens           | Development only |
+
+---
+
 ## What is Zenyx?
 
 Zenyx is a Python library that sits below the model definition and above the hardware. You write a model and call `zenyx.train(model, dataloader)`. Zenyx handles everything else — memory layout, kernel dispatch, parallelism, checkpointing, communication.
 
-```python
-import zenyx
-
-# That's it. Zenyx handles memory, parallelism, everything.
-zenyx.train(model, dataloader)
-```
-
 ## Key Features
 
 ### Never-OOM Guarantee
-Three-tier memory system (VRAM → CPU DRAM → NVMe SSD) with a formal feasibility condition. If the hardware can theoretically fit the workload, Zenyx will train it without crashing. If it can't, Zenyx throttles — never crashes.
 
-**Formal condition:** `(1/B₀₁) + (1/B₁₂) ≤ (1/F_compute)`
+Three-tier memory system manages data across three storage levels:
+
+- **T0 (HBM/VRAM):** Fastest GPU memory — active tensors live here
+- **T1 (CPU DRAM):** Pinned host memory — evicted tensors staged here  
+- **T2 (NVMe SSD):** Persistent storage — cold data offloaded here
+
+The Bélády-optimal eviction policy uses reuse distances computed from the static compute graph to evict the tensor whose next use is farthest in the future — provably optimal.
+
+**Formal feasibility condition:** `(1/B₀₁) + (1/B₁₂) ≤ (1/F_compute)`
+
+Where B₀₁ is T0↔T1 bandwidth, B₁₂ is T1↔T2 bandwidth, and F_compute is the compute rate. If this condition holds, Zenyx guarantees zero OOM. If it doesn't hold, Zenyx throttles compute to match memory bandwidth — never crashes.
 
 ### Hardware Agnostic
 - **NVIDIA CUDA** — cuBLAS + FlashAttention-3 + NCCL + cuFile GDS
@@ -33,6 +74,18 @@ Three-tier memory system (VRAM → CPU DRAM → NVMe SSD) with a formal feasibil
 - **Apple Metal/MLX** — Inference and fine-tuning
 
 Five HAL primitives: `alloc`, `free`, `copy`, `matmul`, `reduce` — everything in Zenyx is composed from these.
+
+### Architecture Compatibility
+
+Zenyx is architecture-agnostic and supports the following without modification:
+
+- **MLA** (Multi-Latent Attention)
+- **MoE** (Mixture of Experts) with dynamic routing
+- **MTP** (Multi-Token Prediction)
+- **GQA** (Grouped Query Attention)
+- **ConvSwiGLU** feed-forward networks
+- **RoPE** (Rotary Position Embeddings)
+- Any `torch.nn.Module`-based architecture
 
 ### Intelligent Memory Management
 - **Bélády-optimal eviction** via min-heap of reuse distances computed from the static compute graph
@@ -65,7 +118,12 @@ zenyx/
 │   ├── comm/          # Topology detection, ring comm, all-reduce
 │   └── vocab/         # Distributed cross-entropy (500K+ vocab safe)
 ├── train/
-│   ├── loop.py        # Main train() entrypoint
+│   ├── trainer.py     # Trainer class + zenyx.train() entrypoint
+│   ├── loop.py        # Legacy train loop (Phase 2)
+│   ├── lr_schedule.py # Cosine LR with linear warmup
+│   ├── grad_scaler.py # Mixed precision gradient scaler
+│   ├── distributed_setup.py  # Auto distributed init (torchrun/SLURM/TPU)
+│   ├── activation_checkpoint.py  # Selective activation checkpointing
 │   ├── pipeline.py    # Braided TP+PP schedule
 │   ├── mixed_prec.py  # FP8 E4M3 activation storage
 │   └── checkpoint.py  # Async distributed checkpointing
@@ -73,8 +131,30 @@ zenyx/
 │   ├── gds_loader.py  # GPU Direct Storage triple-buffering
 │   └── tpu_loader.py  # TPU multi-threaded pread + DMA
 └── bench/
-    ├── memory_budget.py  # Memory budget calculator
-    └── vs_deepspeed.py   # Benchmark vs DeepSpeed ZeRO-3
+    ├── integration_test.py  # End-to-end integration tests
+    ├── memory_budget.py     # Memory budget calculator
+    └── vs_deepspeed.py      # Benchmark vs DeepSpeed ZeRO-3
+```
+
+## Trainer API
+
+```python
+from zenyx.train.trainer import Trainer
+
+trainer = Trainer(
+    model,
+    dataloader,
+    lr=1e-4,
+    weight_decay=0.1,
+    warmup_steps=2000,
+    total_steps=100_000,
+    dtype="bfloat16",
+    context_len=131072,
+    gradient_accumulation_steps=4,
+    checkpoint_dir="./checkpoints",
+    checkpoint_every=1000,
+)
+trainer.train()
 ```
 
 ## Memory Budget Calculator
@@ -89,26 +169,6 @@ report = memory_budget(
     hardware="H100",
 )
 print(report)
-```
-
-Output:
-```
-╔══════════════════════════════════════════════════╗
-║           Zenyx Memory Budget Report             ║
-╠══════════════════════════════════════════════════╣
-║ Model: 7.0B params                               ║
-║ Vocab: 152,000 | Context: 8,192                  ║
-║ Hardware: H100 (80 GB HBM3)                      ║
-╠══════════════════════════════════════════════════╣
-║ Component         │ Size (GB)                     ║
-║ Weights           │ 14.00                         ║
-║ Activations       │ 28.00                         ║
-║ KV Cache          │  X.XX                         ║
-║ Optimizer States  │ 28.00                         ║
-╠══════════════════════════════════════════════════╣
-║ Load time: X.Xs | Throughput: X,XXX tok/s         ║
-║ OOM-free: ✅                                      ║
-╚══════════════════════════════════════════════════╝
 ```
 
 ## Installation

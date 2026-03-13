@@ -119,8 +119,8 @@ def test_memory_pool_no_oom() -> None:
     heap = ReuseHeap()
     assert heap is not None
     # Basic heap operations
-    heap.update_access(block_id=1, op_idx=0)
-    heap.update_access(block_id=2, op_idx=1)
+    heap.update_access(block_id=1, current_op_idx=0)
+    heap.update_access(block_id=2, current_op_idx=1)
     heap.remove_block(block_id=1)
 
 
