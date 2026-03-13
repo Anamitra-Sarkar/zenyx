@@ -81,6 +81,7 @@ def _pallas_local_attention(
     causal: bool,
     q_offset: int,
     kv_offset: int,
+    head_dim: int = 128,
 ) -> Tuple[Any, Any]:
     """Local attention using a Pallas kernel (or JAX fallback).
 
@@ -94,6 +95,8 @@ def _pallas_local_attention(
         Global sequence offset of Q chunk.
     kv_offset : int
         Global sequence offset of KV chunk.
+    head_dim : int
+        Static head dimension for Pallas BlockSpec compilation.
 
     Returns
     -------
@@ -108,12 +111,13 @@ def _pallas_local_attention(
     _check_jax()
 
     if _HAS_PALLAS:
-        return _pallas_kernel_attention(q, k, v, causal, q_offset, kv_offset)
+        return _pallas_kernel_attention(q, k, v, causal, q_offset, kv_offset, head_dim=head_dim)
     return _jax_fallback_attention(q, k, v, causal, q_offset, kv_offset)
 
 
 def _pallas_kernel_attention(
-    q: Any, k: Any, v: Any, causal: bool, q_offset: int, kv_offset: int
+    q: Any, k: Any, v: Any, causal: bool, q_offset: int, kv_offset: int,
+    head_dim: int = 128,
 ) -> Tuple[Any, Any]:
     """Pallas-based local attention kernel for TPU.
 
@@ -127,14 +131,16 @@ def _pallas_kernel_attention(
     """
     B, H, S_q, D = q.shape
     S_kv = k.shape[2]
-    scale = 1.0 / math.sqrt(D)
+    # Use static head_dim for block shapes to avoid JIT recompilation
+    D_static = head_dim
+    scale = 1.0 / math.sqrt(D_static)
 
     def kernel_fn(q_ref: Any, k_ref: Any, v_ref: Any, o_ref: Any, lse_ref: Any) -> None:
         """Pallas kernel body: fused QKV attention with online softmax."""
         # Load tiles
-        q_tile = q_ref[...]  # [S_q, D]
-        k_tile = k_ref[...]  # [S_kv, D]
-        v_tile = v_ref[...]  # [S_kv, D]
+        q_tile = q_ref[...]  # [S_q, D_static]
+        k_tile = k_ref[...]  # [S_kv, D_static]
+        v_tile = v_ref[...]  # [S_kv, D_static]
 
         # Compute scores
         scores = pl.dot(q_tile, k_tile.T) * scale  # [S_q, S_kv]
@@ -154,18 +160,19 @@ def _pallas_kernel_attention(
         o_ref[...] = pl.dot(exp_scores, v_tile) / row_sum[:, None]
         lse_ref[...] = row_max + jnp.log(row_sum)
 
-    # Define grid spec for Pallas
+    # Define grid spec for Pallas — use static D_static for block shapes
+    # to prevent JIT recompilation when head_dim varies between calls.
     out_shape = [
-        jax.ShapeDtypeStruct((S_q, D), q.dtype),  # output
+        jax.ShapeDtypeStruct((S_q, D_static), q.dtype),  # output
         jax.ShapeDtypeStruct((S_q,), jnp.float32),  # lse
     ]
 
     grid_spec = pl.GridSpec(num_programs=1, in_specs=[
-        pl.BlockSpec(block_shape=(S_q, D), index_map=lambda: (0, 0)),
-        pl.BlockSpec(block_shape=(S_kv, D), index_map=lambda: (0, 0)),
-        pl.BlockSpec(block_shape=(S_kv, D), index_map=lambda: (0, 0)),
+        pl.BlockSpec(block_shape=(S_q, D_static), index_map=lambda: (0, 0)),
+        pl.BlockSpec(block_shape=(S_kv, D_static), index_map=lambda: (0, 0)),
+        pl.BlockSpec(block_shape=(S_kv, D_static), index_map=lambda: (0, 0)),
     ], out_specs=[
-        pl.BlockSpec(block_shape=(S_q, D), index_map=lambda: (0, 0)),
+        pl.BlockSpec(block_shape=(S_q, D_static), index_map=lambda: (0, 0)),
         pl.BlockSpec(block_shape=(S_q,), index_map=lambda: (0,)),
     ])
 
@@ -260,13 +267,15 @@ class RingFlashAttentionTPU:
     Space: O(S_local × d) per device
     """
 
-    def __init__(self, causal: bool = True) -> None:
+    def __init__(self, head_dim: int = 128, causal: bool = True) -> None:
         _check_jax()
+        self._head_dim = head_dim
         self._causal = causal
         logger.info(
-            "RingFlashAttentionTPU initialized (pallas=%s, causal=%s)",
+            "RingFlashAttentionTPU initialized (pallas=%s, causal=%s, head_dim=%d)",
             _HAS_PALLAS,
             causal,
+            head_dim,
         )
 
     def __repr__(self) -> str:
@@ -329,7 +338,8 @@ class RingFlashAttentionTPU:
 
             # Local attention
             step_output, step_lse = _pallas_local_attention(
-                q, k_cur, v_cur, self._causal, q_offset, kv_offset
+                q, k_cur, v_cur, self._causal, q_offset, kv_offset,
+                head_dim=self._head_dim,
             )
 
             # Online softmax accumulation
