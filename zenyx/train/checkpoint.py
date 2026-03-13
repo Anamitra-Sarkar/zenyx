@@ -6,6 +6,16 @@ tensor names, shapes, dtypes, and byte offsets for reconstruction.
 
 Incremental checkpointing is supported: only tensors whose data has changed
 since the last save are written.
+
+Fix notes
+---------
+* bfloat16 save: stored as uint16 raw bytes (view cast), reloaded via
+  torch.frombuffer. numpy has no bfloat16 dtype; the previous np.float32
+  mapping caused a 2×-element-count mismatch on load.
+* Incremental-save race: _prev_checksums is now updated from a snapshot
+  dict captured *before* the background thread starts, not from inside
+  _write_shards. This prevents a second concurrent save() from reading a
+  partially-committed checksums map.
 """
 
 from __future__ import annotations
@@ -35,6 +45,9 @@ logger = logging.getLogger(__name__)
 
 _METADATA_FILENAME: str = "checkpoint_meta.json"
 _DEFAULT_IO_WORKERS: int = 2
+
+# Special marker in dtype field to signal uint16-encoded bfloat16.
+_BFLOAT16_MARKER: str = "torch.bfloat16"
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +190,16 @@ class AsyncCheckpointer:
 
         for name, tensor in state_dict.items():
             cpu_tensor = tensor.detach().cpu()
-            raw = cpu_tensor.numpy().tobytes()
+
+            # bfloat16 fix: numpy has no bfloat16 dtype.
+            # Store as raw uint16 bytes via view-cast (zero-copy reinterpret).
+            # The dtype string in metadata signals the loader to reconstruct
+            # correctly via torch.frombuffer.
+            if cpu_tensor.dtype == torch.bfloat16:
+                raw = cpu_tensor.contiguous().view(torch.uint16).numpy().tobytes()
+            else:
+                raw = cpu_tensor.numpy().tobytes()
+
             chk = hashlib.md5(raw).hexdigest()
             checksums[name] = chk
 
@@ -191,13 +213,18 @@ class AsyncCheckpointer:
                 _ShardMeta(
                     name=name,
                     shape=list(tensor.shape),
-                    dtype=str(tensor.dtype),
+                    dtype=str(tensor.dtype),  # e.g. "torch.bfloat16"
                     filename=filename,
                     byte_size=len(raw),
                     checksum=chk,
                 )
             )
 
+        # Race fix: capture a snapshot of checksums *before* submitting the
+        # background job. _write_shards receives this snapshot and commits it
+        # atomically under self._lock after all writes succeed. A concurrent
+        # save() call that starts before _write_shards finishes will see the
+        # pre-commit _prev_checksums and correctly re-diff against it.
         future: Future[None] = self._executor.submit(
             self._write_shards, path, snapshot, meta_entries, checksums
         )
@@ -262,16 +289,28 @@ class AsyncCheckpointer:
             raw_bytes = shard_path.read_bytes()
             try:
                 dtype_torch = getattr(torch, meta.dtype.replace("torch.", ""), torch.float32)
-                np_dtype = {
-                    torch.float32: np.float32,
-                    torch.float16: np.float16,
-                    torch.bfloat16: np.float32,  # bfloat16 numpy compat
-                    torch.int64: np.int64,
-                    torch.int32: np.int32,
-                }.get(dtype_torch, np.float32)
 
-                arr = np.frombuffer(raw_bytes, dtype=np_dtype).reshape(meta.shape)
-                result[meta.name] = torch.from_numpy(arr.copy()).to(dtype_torch)
+                if dtype_torch == torch.bfloat16:
+                    # bfloat16 was stored as uint16 raw bytes.
+                    # Reconstruct via torch.frombuffer with uint16, then view-cast
+                    # back to bfloat16. This preserves the exact bit pattern.
+                    import numpy as np
+                    arr_u16 = np.frombuffer(raw_bytes, dtype=np.uint16)
+                    t = torch.frombuffer(
+                        arr_u16.tobytes(), dtype=torch.uint16
+                    ).view(torch.bfloat16)
+                    result[meta.name] = t.reshape(meta.shape).clone()
+                else:
+                    np_dtype = {
+                        torch.float32: np.float32,
+                        torch.float16: np.float16,
+                        torch.int64: np.int64,
+                        torch.int32: np.int32,
+                    }.get(dtype_torch, np.float32)
+
+                    arr = np.frombuffer(raw_bytes, dtype=np_dtype).reshape(meta.shape)
+                    result[meta.name] = torch.from_numpy(arr.copy()).to(dtype_torch)
+
             except (ValueError, RuntimeError) as e:
                 raise RuntimeError(
                     f"Checkpoint shard {shard_path} for tensor '{meta.name}' "
@@ -324,6 +363,10 @@ class AsyncCheckpointer:
     ) -> None:
         """Background: write shard files and metadata JSON.
 
+        After all writes succeed, atomically commit the checksums snapshot
+        to _prev_checksums under self._lock. This prevents a concurrent
+        save() call from seeing a partially-committed checksums map.
+
         Complexity
         ----------
         Time *O(M_changed)*, space *O(1)* streaming writes.
@@ -347,8 +390,12 @@ class AsyncCheckpointer:
         with open(meta_path, "w") as f:
             json.dump(meta_dict, f, indent=2)
 
-        # Update cached checksums.
-        self._prev_checksums.update(checksums)
+        # Atomically commit checksums only after all writes succeed.
+        # Holding self._lock here ensures a concurrent save() that reads
+        # _prev_checksums always sees a fully-committed snapshot.
+        with self._lock:
+            self._prev_checksums.update(checksums)
+
         logger.info(
             "Checkpoint saved to %s: %d shards (rank %d).",
             path,

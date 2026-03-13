@@ -9,6 +9,17 @@ correct attention kernel (ring_flash_cuda for H100, ring_pallas_tpu for
 TPU, flash_cpu for CPU), configures the optimizer, and runs the training
 loop. The user never touches distributed setup, memory management, or
 kernel selection.
+
+Fix notes
+---------
+* validate_memory_bandwidth: was reading non-existent field `hbm_bandwidth_gbs`
+  (always 0.0, triggering early-return guard every run). Now correctly reads
+  `bandwidth_t0_t1` (bytes/s) and converts to GB/s.
+* _load_checkpoint with loader_config: the fast ModelLoader path previously
+  only restored model weights and silently dropped optimizer state, scheduler
+  state, and step counter. It now loads the full state dict from disk first
+  via torch.load and restores all state, then calls loader.load() to populate
+  the model weights efficiently.
 """
 
 from __future__ import annotations
@@ -340,10 +351,12 @@ class Trainer:
             except ImportError:
                 pass
 
-        # --- Step 15: Audit Fix 1 — Memory bandwidth validation [DISPUTE 7-A] ---
+        # --- Step 15: Memory bandwidth validation [DISPUTE 7-A] ---
+        # Fix: HardwareInfo exposes bandwidth_t0_t1 in bytes/s, not hbm_bandwidth_gbs.
+        # Convert bytes/s → GB/s before calling the validation formulas.
         self.validate_memory_bandwidth()
 
-        # --- Step 16: Audit Fix 3 — Batch size sanity check ---
+        # --- Step 16: Batch size sanity check ---
         num_params = sum(p.numel() for p in model.parameters())
         global_batch_tokens = context_len * max(1, gradient_accumulation_steps)
         min_recommended_tokens_per_step = 65_536
@@ -478,6 +491,11 @@ class Trainer:
         Runs BOTH the corrected and original feasibility formulas.
         Emits RuntimeWarning if EITHER flags a violation.
 
+        Fix: HardwareInfo.bandwidth_t0_t1 is in bytes/s. Convert to GB/s
+        before passing to the validation formulas which expect GB/s.
+        The previous code read the non-existent field `hbm_bandwidth_gbs`,
+        always getting 0.0 and hitting the early-return guard on every run.
+
         Source A: min(B_01, B_12) >= AI × Fcompute (corrected)
         Source B: 1/B_01 + 1/B_12 <= 1/Fcompute (original)
         """
@@ -486,12 +504,19 @@ class Trainer:
             validate_bandwidth_original,
         )
 
-        b_01 = getattr(self._hw_info, "hbm_bandwidth_gbs", 0.0) if hasattr(self, "_hw_info") else 0.0
-        b_12 = 7.5  # Conservative PCIe Gen4 NVMe default
+        # bandwidth_t0_t1 is in bytes/s — convert to GB/s.
+        b_01_bytes_per_s = getattr(self._hw_info, "bandwidth_t0_t1", 0.0) if hasattr(self, "_hw_info") else 0.0
+        b_01 = b_01_bytes_per_s / (1024 ** 3)  # bytes/s → GB/s
+        b_12 = 7.5  # Conservative PCIe Gen4 NVMe default (GB/s)
         compute_tflops = getattr(self._hw_info, "compute_tflops", 0.0) if hasattr(self, "_hw_info") else 0.0
 
         if b_01 <= 0 or compute_tflops <= 0:
-            logger.debug("Bandwidth validation skipped (incomplete hardware info)")
+            logger.debug(
+                "Bandwidth validation skipped (incomplete hardware info: "
+                "b_01=%.3f GB/s, compute_tflops=%.1f). "
+                "This is expected on CPU-only runs.",
+                b_01, compute_tflops,
+            )
             return
 
         corrected_result = validate_bandwidth_corrected(b_01, b_12, compute_tflops)
@@ -770,6 +795,10 @@ class Trainer:
     def _infer_vocab_size(self) -> int:
         """Try to infer vocabulary size from model attributes.
 
+        Note: falls back to 32000 (LLaMA vocabulary) if not detectable.
+        This is a heuristic — models with different vocab sizes should
+        expose a .config.vocab_size attribute.
+
         Time: O(1).
         """
         for attr in ("config", "cfg"):
@@ -779,7 +808,7 @@ class Trainer:
                     val = getattr(cfg, key, None)
                     if val is not None:
                         return int(val)
-        return 32000
+        return 32000  # LLaMA default; may be wrong for other architectures
 
     def _infer_batch_size(self) -> int:
         """Try to infer batch size from the dataloader.
@@ -831,8 +860,16 @@ class Trainer:
     def _load_checkpoint(self, path: str) -> None:
         """Load a checkpoint from disk.
 
+        Fix: when loader_config is set, the previous code only restored model
+        weights via ModelLoader and silently dropped optimizer state, scheduler
+        state, and the step counter. Now the full state dict is loaded from
+        disk first (torch.load), all non-weight state is restored, and then
+        loader.load() is called to populate model weights via the fast
+        triple-buffered path.
+
         If a loader_config is set, uses the fast ModelLoader for triple-buffered
-        loading. Otherwise falls back to standard torch.load.
+        weight loading. Otherwise falls back to standard torch.load for weights.
+        In both cases, optimizer, scheduler, and step state are always restored.
         """
         if not os.path.exists(path):
             logger.warning("Checkpoint not found: %s", path)
@@ -842,6 +879,28 @@ class Trainer:
             if self._loader_config is not None:
                 from zenyx.loader.loader import ModelLoader
 
+                # Load the full state dict from disk to restore all training state.
+                # weights_only=False is required here because optimizer state dicts
+                # contain non-tensor objects (e.g. param groups with Python ints/floats).
+                # The file is assumed to be a trusted Zenyx checkpoint.
+                full_state = torch.load(
+                    path, map_location=self._device, weights_only=False
+                )
+
+                # Restore non-weight state first.
+                self._optimizer.load_state_dict(full_state["optimizer_state_dict"])
+                self._step = full_state.get("step", 0)
+                if "scheduler_state" in full_state:
+                    self._scheduler.load_state_dict(full_state["scheduler_state"])
+                elif "scheduler_step" in full_state:
+                    logger.warning(
+                        "Old checkpoint format detected (scheduler_step). "
+                        "Falling back to step-loop scheduler restore."
+                    )
+                    for _ in range(full_state["scheduler_step"]):
+                        self._scheduler.step()
+
+                # Now use the fast loader for the model weights (triple-buffered).
                 loader = ModelLoader(
                     hal=self._hal,
                     hw_info=self._hw_info,
@@ -851,7 +910,10 @@ class Trainer:
                     dtype=self._loader_config.dtype,
                 )
                 self._model = loader.load(path, self._model)
-                logger.info("Loaded checkpoint via fast ModelLoader: %s", path)
+                logger.info(
+                    "Resumed from checkpoint via fast ModelLoader: %s (step %d)",
+                    path, self._step,
+                )
             else:
                 state = torch.load(path, map_location=self._device, weights_only=True)
                 self._model.load_state_dict(state["model_state_dict"])
