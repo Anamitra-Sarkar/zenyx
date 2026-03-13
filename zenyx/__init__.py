@@ -23,7 +23,7 @@ Usage::
 
 from __future__ import annotations
 
-__version__ = "0.6.0"
+__version__ = "1.0.0"
 __all__ = [
     "__version__",
     "Trainer",
@@ -37,6 +37,18 @@ __all__ = [
     "barrier",
     "ModelLoader",
     "load_model",
+    # Phase 7: KV Cache Tiering
+    "BeladyKVCacheManager",
+    # Phase 8: FP8 KV Quantization
+    "quantize_kv_fp8",
+    "dequantize_kv",
+    "GradientMonitor",
+    # Phase 9: Dynamic Ring Curriculum
+    "RingCurriculumManager",
+    "CurriculumConfig",
+    # Phase 10: Sparse Ring Attention
+    "SparseRingAttentionKernel",
+    "compute_skip_schedule",
 ]
 
 import logging
@@ -57,6 +69,12 @@ from zenyx.train.distributed_setup import (
     barrier,
 )
 from zenyx.loader.loader import ModelLoader, load_model
+
+# Phase 7-10 imports
+from zenyx.train.kv_cache_tier import BeladyKVCacheManager
+from zenyx.train.fp8_kv import quantize_kv_fp8, dequantize_kv, GradientMonitor
+from zenyx.train.ring_curriculum import RingCurriculumManager, CurriculumConfig
+from zenyx.ops.attention.sparse_ring_attn import SparseRingAttentionKernel, compute_skip_schedule
 
 # Convenience: auto-init distributed on import if env vars suggest it
 # but ONLY if ZENYX_AUTO_INIT_DISTRIBUTED=1 is set

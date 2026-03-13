@@ -114,12 +114,15 @@ zenyx/
 │   ├── allocator/     # Three-tier memory pool + Bélády eviction
 │   └── agent/         # Profiler, parallelism planner, training controller
 ├── ops/
-│   ├── attention/     # Ring FlashAttention (CUDA, TPU, CPU)
+│   ├── attention/     # Ring FlashAttention (CUDA, TPU, CPU) + Sparse Ring (Phase 10)
 │   ├── comm/          # Topology detection, ring comm, all-reduce
 │   └── vocab/         # Distributed cross-entropy (500K+ vocab safe)
 ├── train/
 │   ├── trainer.py     # Trainer class + zenyx.train() entrypoint
-│   ├── loop.py        # Legacy train loop (Phase 2)
+│   ├── loop.py        # Legacy train loop (Phase 2, deprecated)
+│   ├── kv_cache_tier.py  # Phase 7: Bélády-optimal KV cache tiering
+│   ├── fp8_kv.py      # Phase 8: FP8 KV quantization + STE + SwiGLU
+│   ├── ring_curriculum.py # Phase 9: Dynamic ring degree curriculum
 │   ├── lr_schedule.py # Cosine LR with linear warmup
 │   ├── grad_scaler.py # Mixed precision gradient scaler
 │   ├── distributed_setup.py  # Auto distributed init (torchrun/SLURM/TPU)
@@ -137,6 +140,14 @@ zenyx/
     ├── integration_test.py  # End-to-end integration tests
     ├── memory_budget.py     # Memory budget calculator
     └── vs_deepspeed.py      # Benchmark vs DeepSpeed ZeRO-3
+```
+
+### Documentation
+
+```
+zenyx/docs/
+├── performance_ceiling.md  # Throughput analysis for 1T model on 8-chip TPU v5e
+└── dispute_resolutions.md  # Research dispute empirical outcomes
 ```
 
 ## Trainer API
@@ -233,6 +244,55 @@ trainer = zenyx.train(
 | Triple-buffering     | ✅                           | ✅ (thread pool)  | N/A          |
 | Rollback on failure  | ✅                           | ✅                | ✅            |
 | Integrity validation | ✅                           | ✅                | ✅            |
+
+## Phases 7–10 (v1.0.0) — Advanced Training Features
+
+### Phase 7: Bélády-Optimal KV Cache Tiering
+
+Three-tier (T0=HBM, T1=DRAM, T2=NVMe) KV cache manager for ring attention training.
+Uses the deterministic ring rotation schedule to compute Bélády-optimal eviction
+over the combined forward + backward timeline.
+
+### Phase 8: FP8 KV Quantization
+
+FP8 E4M3 quantization of K and V tensors during training with per-channel dynamic
+scaling for K and per-token dynamic scaling for V. Includes Smooth-SwiGLU to prevent
+outlier amplification and gradient monitoring with STE (Straight-Through Estimator).
+
+### Phase 9: Dynamic Ring Degree
+
+Live resharding of the sequence dimension as context length grows during curriculum
+training (8K → 32K → 128K → 512K → 1M tokens). Exponential step-wise doubling with
+automatic convergence detection and PRNG key realignment.
+
+### Phase 10: Sparse Ring Attention
+
+Block-sparse ring attention with hybrid local + strided topology. Skips HBM loads
+entirely for masked blocks using Pallas scalar prefetch API. Production skip fraction
+is 62.5% (5/8 blocks skipped per device).
+
+### Quickstart with Phase 7–10 Features
+
+```python
+import zenyx
+
+trainer = zenyx.train(
+    model,
+    dataloader,
+    context_len=131072,
+    dtype="bfloat16",
+    # Phase 8: FP8 KV quantization with per-channel scaling
+    fp8_kv=True,
+    fp8_quant_strategy="per_channel",
+    # Phase 10: Sparse ring attention
+    sparse_attn=True,
+    sparse_skip_mode="production",
+)
+```
+
+All Phase 7–10 features can be combined. See `zenyx/docs/dispute_resolutions.md`
+for research validation details and `zenyx/docs/performance_ceiling.md` for
+throughput analysis.
 
 ## Installation
 
