@@ -260,3 +260,64 @@ class TestCurriculumConfig:
         cfg = CurriculumConfig(max_seq_len=8192, no_recompile=True)
         assert cfg.max_seq_len == 8192
         assert cfg.no_recompile is True
+
+
+# ---------------------------------------------------------------------------
+# Issue 9 — reshard cost invariant: opt < pess for all valid positive inputs
+# ---------------------------------------------------------------------------
+#
+# Proof (at default parameters):
+#   opt_payload  = seq_len × hidden_dim × bytes_per_element
+#                = seq_len × 4096 × 2
+#   pess_payload = seq_len × bytes_per_token_per_layer × num_layers
+#                = seq_len × 4096 × 126
+#   Both share the same ici_bandwidth_gbs denominator, so:
+#   pess / opt = (4096 × 126) / (4096 × 2) = 126 / 2 = 63  > 1
+#   Therefore opt < pess ∀ seq_len > 0, ici_bandwidth_gbs > 0.
+#
+# The parametrized test below exercises 10 distinct (seq_len, world_size,
+# bw_gbps) combinations and asserts opt < pess at the shared seq_len and
+# bw_gbps, holding all other parameters at defaults.
+
+
+@pytest.mark.parametrize(
+    "seq_len, world_size, bw_gbps",
+    [
+        (1_000, 1, 100.0),
+        (1_000_000, 8, 3200.0),
+        (8_192, 2, 50.0),
+        (1, 1, 0.001),
+        (999_999, 7, 12.5),
+        (65_536, 4, 800.0),
+        (131_072, 16, 3200.0),
+        (500_000, 8, 400.0),
+        (1_000_000, 1, 1.0),
+        (2, 2, 100.0),
+    ],
+)
+def test_reshard_cost_invariant_opt_lt_pess(
+    seq_len: int, world_size: int, bw_gbps: float
+) -> None:
+    """opt < pess for all valid positive inputs (same seq_len and bw_gbps).
+
+    world_size is accepted for parametrization completeness but not passed to
+    the cost functions — both functions share only seq_len and ici_bandwidth_gbs
+    as common parameters.  The invariant is purely a function of the payload
+    ratio (63x), independent of world_size.
+    """
+    opt = compute_reshard_cost_optimistic(
+        seq_len=seq_len, ici_bandwidth_gbs=bw_gbps
+    )
+    pess = compute_reshard_cost_pessimistic(
+        seq_len=seq_len, ici_bandwidth_gbs=bw_gbps
+    )
+    assert opt < pess, (
+        f"Invariant violated: opt={opt} >= pess={pess} "
+        f"(seq_len={seq_len}, bw_gbps={bw_gbps})"
+    )
+    # Also verify the exact ratio holds (pess/opt = 63.0 at defaults)
+    ratio = pess / opt
+    assert abs(ratio - 63.0) < 1e-9, (
+        f"Expected pess/opt=63.0 at default params, got {ratio} "
+        f"(seq_len={seq_len}, bw_gbps={bw_gbps})"
+    )
