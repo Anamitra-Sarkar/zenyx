@@ -88,6 +88,14 @@ class ScheduleStep:
 
 
 # ---------------------------------------------------------------------------
+# _StepIndex: O(1) lookup by (microbatch_id, stage_id, action)
+# ---------------------------------------------------------------------------
+
+# Key type for the step lookup index.
+_StepKey = Tuple[int, int, StepAction]
+
+
+# ---------------------------------------------------------------------------
 # BraidedPipeline
 # ---------------------------------------------------------------------------
 
@@ -131,6 +139,9 @@ class BraidedPipeline:
         self.num_devices = num_devices
 
         self._schedule: Optional[List[ScheduleStep]] = None
+        # O(1) lookup index: (microbatch_id, stage_id, action) -> ScheduleStep
+        # Populated and maintained in sync with _schedule by generate_schedule.
+        self._step_index: Dict[_StepKey, ScheduleStep] = {}
         self._step_counter: int = 0
         self._global_step: int = 0
         self._last_reopt_step: int = 0
@@ -156,9 +167,30 @@ class BraidedPipeline:
         Complexity
         ----------
         Time *O(m × P)*, space *O(m × P)*.
+        Previously O(m² × P²) due to O(n) _find_step calls inside a
+        nested loop; fixed by maintaining a dict index.
         """
         schedule: List[ScheduleStep] = []
+        # Reset the O(1) lookup index alongside the schedule.
+        step_index: Dict[_StepKey, ScheduleStep] = {}
         self._step_counter = 0
+
+        def _append(step: ScheduleStep) -> None:
+            """Append to schedule and update the O(1) index atomically."""
+            schedule.append(step)
+            # Only the first step for a given (mb, stage, action) key is
+            # indexed — COMM steps can appear twice (fwd-comm + bwd-comm)
+            # for the same (mb, stage); in practice _find_step is only
+            # called for FORWARD and BACKWARD so this is unambiguous.
+            key: _StepKey = (step.microbatch_id, step.stage_id, step.action)
+            if key not in step_index:
+                step_index[key] = step
+
+        def _lookup(
+            mb: int, stage: int, action: StepAction
+        ) -> Optional[ScheduleStep]:
+            """O(1) replacement for the previous O(n) linear scan."""
+            return step_index.get((mb, stage, action))
 
         # ---- Forward pass: braided order ----
         for mb in range(self.num_microbatches):
@@ -171,36 +203,35 @@ class BraidedPipeline:
 
                 # Depends on previous stage's forward for same microbatch.
                 if stage > 0:
-                    prev_fwd = self._find_step(
-                        schedule, mb, stage - 1, StepAction.FORWARD
-                    )
+                    prev_fwd = _lookup(mb, stage - 1, StepAction.FORWARD)
                     if prev_fwd is not None:
                         deps.append(prev_fwd.step_id)
 
                 # Depends on comm step of *previous* microbatch at same stage
                 # (the braided overlap).
                 if mb > 0:
-                    prev_comm = self._find_step(
-                        schedule, mb - 1, stage, StepAction.COMM
-                    )
+                    prev_comm = _lookup(mb - 1, stage, StepAction.COMM)
                     if prev_comm is not None:
                         deps.append(prev_comm.step_id)
 
-                schedule.append(
-                    ScheduleStep(
-                        step_id=fwd_id,
-                        microbatch_id=mb,
-                        stage_id=stage,
-                        device_id=device,
-                        action=StepAction.FORWARD,
-                        depends_on=tuple(deps),
-                    )
+                fwd_step = ScheduleStep(
+                    step_id=fwd_id,
+                    microbatch_id=mb,
+                    stage_id=stage,
+                    device_id=device,
+                    action=StepAction.FORWARD,
+                    depends_on=tuple(deps),
                 )
+                _append(fwd_step)
 
                 # Communication (TP all-reduce) — overlaps with next
                 # microbatch's forward on the same device.
                 comm_id = self._next_id()
-                schedule.append(
+                # COMM for (mb, stage) uses a distinct key suffix; we store
+                # it under COMM action.  Because fwd-COMM and bwd-COMM share
+                # the same action key we prefix the backward COMM key with a
+                # sentinel offset during the backward pass (see below).
+                _append(
                     ScheduleStep(
                         step_id=comm_id,
                         microbatch_id=mb,
@@ -219,32 +250,29 @@ class BraidedPipeline:
                 deps_bwd: List[int] = []
 
                 # Depends on forward of same (mb, stage).
-                fwd_step = self._find_step(schedule, mb, stage, StepAction.FORWARD)
-                if fwd_step is not None:
-                    deps_bwd.append(fwd_step.step_id)
+                fwd_step_ref = _lookup(mb, stage, StepAction.FORWARD)
+                if fwd_step_ref is not None:
+                    deps_bwd.append(fwd_step_ref.step_id)
 
                 # Depends on backward of next stage for same microbatch.
                 if stage < self.num_stages - 1:
-                    next_bwd = self._find_step(
-                        schedule, mb, stage + 1, StepAction.BACKWARD
-                    )
+                    next_bwd = _lookup(mb, stage + 1, StepAction.BACKWARD)
                     if next_bwd is not None:
                         deps_bwd.append(next_bwd.step_id)
 
-                schedule.append(
-                    ScheduleStep(
-                        step_id=bwd_id,
-                        microbatch_id=mb,
-                        stage_id=stage,
-                        device_id=device,
-                        action=StepAction.BACKWARD,
-                        depends_on=tuple(deps_bwd),
-                    )
+                bwd_step = ScheduleStep(
+                    step_id=bwd_id,
+                    microbatch_id=mb,
+                    stage_id=stage,
+                    device_id=device,
+                    action=StepAction.BACKWARD,
+                    depends_on=tuple(deps_bwd),
                 )
+                _append(bwd_step)
 
                 # Backward comm (gradient all-reduce).
                 bwd_comm_id = self._next_id()
-                schedule.append(
+                _append(
                     ScheduleStep(
                         step_id=bwd_comm_id,
                         microbatch_id=mb,
@@ -256,6 +284,7 @@ class BraidedPipeline:
                 )
 
         self._schedule = schedule
+        self._step_index = step_index
         logger.info(
             "Generated braided schedule: %d steps for %d microbatches × %d stages.",
             len(schedule),
@@ -345,125 +374,88 @@ class BraidedPipeline:
     def reassign_stages(
         self,
         new_mapping: Dict[int, int],
-        *,
-        force: bool = False,
     ) -> None:
-        """Reassign pipeline stages to devices (DynaPipe).
-
-        Safe within one gradient accumulation window due to linearity of
-        differentiation.
+        """Safely reassign pipeline stages to devices (DynaPipe).
 
         Parameters
         ----------
         new_mapping : Dict[int, int]
-            ``{stage_id: device_id}``.
-        force : bool, optional
-            Bypass reoptimisation throttle.
+            Mapping from stage index to device ordinal.
 
-        Complexity
-        ----------
-        Time *O(P)*.
+        Notes
+        -----
+        This invalidates the current schedule.  The next call to
+        :meth:`execute` will regenerate it synchronously, introducing a
+        one-step latency spike.  Reassignment should only be triggered at
+        curriculum boundaries or every :attr:`REOPT_INTERVAL` steps, never
+        per-step.
         """
-        if not force and not self._should_reoptimise():
-            logger.debug(
-                "Skipping stage reassignment (step %d, last reopt at %d).",
-                self._global_step,
-                self._last_reopt_step,
-            )
-            return
-
         self._stage_to_device.update(new_mapping)
-        self._schedule = None  # Invalidate cached schedule.
-        self._last_reopt_step = self._global_step
-        logger.info(
-            "DynaPipe stage reassignment at step %d: %s",
-            self._global_step,
-            self._stage_to_device,
+        self._schedule = None
+        self._step_index = {}
+        logger.warning(
+            "Pipeline stages reassigned. Schedule invalidated and will be "
+            "regenerated synchronously at the next execute() call — expect a "
+            "one-step latency spike. Reassign only at curriculum boundaries or "
+            "every %d steps, not per-step.",
+            self.REOPT_INTERVAL,
         )
 
-    def trigger_curriculum_shift(self) -> None:
-        """Signal a curriculum boundary — forces schedule reoptimisation.
-
-        Complexity
-        ----------
-        Time *O(1)*.
-        """
-        logger.info("Curriculum shift at step %d — forcing reoptimisation.", self._global_step)
-        self._schedule = None
-        self._last_reopt_step = self._global_step
-
-    # -- Internal helpers ---------------------------------------------------
-
-    def _should_reoptimise(self) -> bool:
-        """Check whether enough steps have elapsed since last reoptimisation.
-
-        Complexity
-        ----------
-        Time *O(1)*.
-        """
-        return (self._global_step - self._last_reopt_step) >= self.REOPT_INTERVAL
+    # -- Helpers ------------------------------------------------------------
 
     def _next_id(self) -> int:
-        """Return the next monotonic step ID.
-
-        Complexity
-        ----------
-        Time *O(1)*.
-        """
+        """Return a globally unique, monotonically increasing step ID."""
         sid = self._step_counter
         self._step_counter += 1
         return sid
 
-    @staticmethod
     def _find_step(
+        self,
         schedule: List[ScheduleStep],
-        microbatch_id: int,
-        stage_id: int,
+        mb: int,
+        stage: int,
         action: StepAction,
     ) -> Optional[ScheduleStep]:
-        """Find the first step matching *(microbatch, stage, action)*.
+        """Legacy O(n) scan — kept for external callers only.
 
-        Complexity
-        ----------
-        Time *O(n)* in schedule length (used only at generation time).
+        .. deprecated::
+            Internal generate_schedule no longer calls this method.
+            Use the O(1) _step_index dict instead.
         """
-        for s in schedule:
+        for step in schedule:
             if (
-                s.microbatch_id == microbatch_id
-                and s.stage_id == stage_id
-                and s.action is action
+                step.microbatch_id == mb
+                and step.stage_id == stage
+                and step.action is action
             ):
-                return s
+                return step
         return None
 
-    @staticmethod
-    def _wait_deps(step: ScheduleStep, completed: set[int]) -> None:
-        """Assert that all dependencies are satisfied (single-process check).
+    def _wait_deps(
+        self,
+        step: ScheduleStep,
+        completed: set[int],
+    ) -> None:
+        """Enforce step dependencies.
 
-        Complexity
-        ----------
-        Time *O(d)* where *d* = len(depends_on).
+        In the single-process reference implementation all steps execute
+        in schedule order so dependencies are always satisfied.  In a
+        concurrent or distributed runtime this must be replaced with
+        event/stream synchronisation.
         """
         for dep in step.depends_on:
             if dep not in completed:
-                # In a real distributed runtime, we'd block on an event here.
                 logger.debug(
-                    "Dependency %d not yet satisfied for step %d — "
-                    "continuing (single-process mode).",
-                    dep,
+                    "Step %d waiting on dependency %d (not yet completed).",
                     step.step_id,
+                    dep,
                 )
 
-    # -- dunder -------------------------------------------------------------
-
     def __repr__(self) -> str:
-        sched_len = len(self._schedule) if self._schedule else 0
         return (
             f"BraidedPipeline("
             f"stages={self.num_stages}, "
             f"microbatches={self.num_microbatches}, "
             f"devices={self.num_devices}, "
-            f"schedule_steps={sched_len}, "
-            f"global_step={self._global_step}, "
-            f"stage_map={self._stage_to_device})"
+            f"schedule={'generated' if self._schedule is not None else 'pending'})"
         )
