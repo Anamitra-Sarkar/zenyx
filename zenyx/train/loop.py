@@ -21,17 +21,17 @@ Workflow
 from __future__ import annotations
 
 import logging
-import math
 import os
+import warnings
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, Optional
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from zenyx.train.checkpoint import AsyncCheckpointer
-from zenyx.train.mixed_prec import FP8ActivationStorage, fp8_checkpoint
+from zenyx.train.mixed_prec import FP8ActivationStorage
 from zenyx.train.pipeline import BraidedPipeline
 
 __all__ = [
@@ -46,6 +46,9 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_CHECKPOINT_EVERY: int = 500  # steps
 _OOM_RETRY_LIMIT: int = 3
+
+# One-shot warning flag for no-label fake-loss path.
+_FAKE_LOSS_WARNED: bool = False
 
 # ---------------------------------------------------------------------------
 # Hardware detection (lightweight — full detector in detector.py)
@@ -178,32 +181,31 @@ def _check_feasibility(hw: Dict[str, Any], profile: Dict[str, Any]) -> bool:
 
 @contextmanager
 def _oom_guard(label: str = "step") -> Iterator[None]:
-    """Context manager that catches CUDA OOM and retries after eviction.
+    """Context manager that catches CUDA OOM on the *first* attempt only.
+
+    .. note::
+        A ``@contextmanager`` generator cannot be retried — once ``yield``
+        returns control to the caller's ``with`` block, the generator cannot
+        be resumed a second time for the same context invocation.  Retry
+        logic therefore lives in :func:`_safe_forward_backward` which uses
+        an explicit ``for`` loop.  This wrapper is kept for single-shot OOM
+        protection of miscellaneous CUDA operations outside the forward/
+        backward path.
 
     Complexity
     ----------
     Time *O(1)* overhead.
     """
-    for attempt in range(_OOM_RETRY_LIMIT):
-        try:
-            yield
-            return
-        except torch.cuda.OutOfMemoryError:
-            logger.warning(
-                "OOM during %s (attempt %d/%d) — evicting caches and retrying.",
-                label,
-                attempt + 1,
-                _OOM_RETRY_LIMIT,
-            )
-            torch.cuda.empty_cache()
-            if attempt == _OOM_RETRY_LIMIT - 1:
-                logger.error(
-                    "Persistent OOM after %d retries in %s — "
-                    "reducing batch and continuing.",
-                    _OOM_RETRY_LIMIT,
-                    label,
-                )
-                return
+    try:
+        yield
+    except torch.cuda.OutOfMemoryError:
+        logger.warning(
+            "OOM during %s — evicting caches. "
+            "Use _safe_forward_backward for retryable forward/backward passes.",
+            label,
+        )
+        torch.cuda.empty_cache()
+        raise
 
 
 def _safe_forward_backward(
@@ -211,18 +213,35 @@ def _safe_forward_backward(
     batch: torch.Tensor,
     device: torch.device,
 ) -> Optional[torch.Tensor]:
-    """Run forward + backward with OOM protection.
+    """Run forward + backward with OOM protection and full exception logging.
+
+    Retries up to ``_OOM_RETRY_LIMIT`` times on CUDA OOM.  All other
+    exceptions are logged with full traceback context before re-raising so
+    that shape mismatches, dtype errors, and NaN propagation are never
+    silently swallowed.
 
     Complexity
     ----------
     Time *O(forward + backward)*.
     """
+    global _FAKE_LOSS_WARNED
+
     for attempt in range(_OOM_RETRY_LIMIT):
         try:
             batch_dev = batch.to(device, non_blocking=True)
             output = model(batch_dev)
             if output.requires_grad:
-                loss = output.sum()  # scalar loss for backward
+                loss = output.sum()  # scalar proxy — see warning below
+                if not _FAKE_LOSS_WARNED:
+                    warnings.warn(
+                        "_safe_forward_backward: no labels provided. "
+                        "Using output.sum() as a proxy loss — gradients are "
+                        "trivially uniform and carry no learning signal. "
+                        "Pass labelled batches or use Trainer for real training.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                    _FAKE_LOSS_WARNED = True
                 loss.backward()
                 return loss.detach()
             return output.detach()
@@ -233,8 +252,17 @@ def _safe_forward_backward(
                 _OOM_RETRY_LIMIT,
             )
             torch.cuda.empty_cache()
+        except Exception:
+            # Log full traceback so shape mismatches / dtype errors are visible.
+            logger.exception(
+                "Unhandled exception in forward/backward (attempt %d/%d, batch shape=%s).",
+                attempt + 1,
+                _OOM_RETRY_LIMIT,
+                tuple(batch.shape) if hasattr(batch, "shape") else "unknown",
+            )
+            raise
 
-    logger.error("Persistent OOM — skipping this batch.")
+    logger.error("Persistent OOM after %d retries — skipping this batch.", _OOM_RETRY_LIMIT)
     return None
 
 
@@ -274,13 +302,13 @@ def wrap(
     ----------
     Time *O(L)* where *L* = number of layers.
     """
-    import warnings
     warnings.warn(
         "loop.py is deprecated. Use zenyx.train.trainer.Trainer instead.",
         DeprecationWarning,
         stacklevel=2,
     )
-    model = fp8_checkpoint(
+    from zenyx.train.mixed_prec import fp8_checkpoint as _fp8_ckpt
+    model = _fp8_ckpt(
         model,
         every_n=fp8_every_n,
         force_simulated=force_simulated_fp8,
@@ -348,7 +376,6 @@ def _legacy_train(
     Time *O(steps × (forward + backward + optimiser))*.
     """
     # ---- Step 1: Hardware detection ----
-    import warnings
     warnings.warn(
         "loop.py is deprecated. Use zenyx.train.trainer.Trainer instead.",
         DeprecationWarning,
