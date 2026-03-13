@@ -193,7 +193,7 @@ def vocab_parallel_cross_entropy(
     Returns
     -------
     Tensor
-        Scalar cross-entropy loss (mean-reduced).
+        Per-token cross-entropy loss.
 
     Complexity
     ----------

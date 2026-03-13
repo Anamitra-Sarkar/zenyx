@@ -73,6 +73,12 @@ class RingCommunicator:
             self._ring_order,
         )
 
+        # Async send/recv state (initialised to prevent hasattr checks)
+        self._send_req: Optional[Any] = None
+        self._recv_req: Optional[Any] = None
+        self._recv_buffer: Optional[torch.Tensor] = None
+        self._step_counter: int = 0
+
     def __repr__(self) -> str:
         return (
             f"RingCommunicator(rank={self._rank}, world={self._world_size}, "
@@ -351,7 +357,7 @@ class RingCommunicator:
         """
         if self._world_size <= 1:
             return
-        if hasattr(self, "_send_req") and self._send_req is not None:
+        if self._send_req is not None:
             self._send_req.wait()
             self._send_req = None
 
@@ -367,10 +373,11 @@ class RingCommunicator:
         Space complexity: O(1).
         """
         if self._world_size <= 1:
-            return getattr(self, "_recv_buffer", torch.empty(0))
-        if hasattr(self, "_recv_req") and self._recv_req is not None:
+            return self._recv_buffer if self._recv_buffer is not None else torch.empty(0)
+        if self._recv_req is not None:
             self._recv_req.wait()
             self._recv_req = None
+        assert self._recv_buffer is not None
         return self._recv_buffer
 
     def step(self) -> None:
@@ -379,8 +386,6 @@ class RingCommunicator:
         Time complexity:  O(1).
         Space complexity: O(1).
         """
-        if not hasattr(self, "_step_counter"):
-            self._step_counter = 0
         self._step_counter += 1
 
     @property
@@ -403,7 +408,7 @@ class RingCommunicator:
         int
             The rank whose KV data this device currently holds.
         """
-        steps = getattr(self, "_step_counter", 0)
+        steps = self._step_counter
         return (self._rank - steps) % self._world_size
 
 

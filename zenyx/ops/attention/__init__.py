@@ -22,3 +22,6 @@ def __getattr__(name: str) -> object:
         from zenyx.ops.attention import ring_pallas_tpu
         return getattr(ring_pallas_tpu, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+# Include TPU names in __all__ for documentation purposes
+__all__ += ["RingFlashAttentionTPU", "ring_attention_tpu"]
