@@ -15,20 +15,22 @@ Key components
 * :func:`fp8_checkpoint` — convenience wrapper: apply FP8 activation
   checkpointing every *N*-th layer of any ``nn.Module``.
 
-Fix note (simulated path)
---------------------------
-The previous simulated quantize path cast scaled activations to ``uint8``
-(range [0, 255]).  Because the scaled range is [-448, 448], every negative
-value was silently zeroed by the unsigned cast, producing garbage gradients
-for half the activation dynamic range.  The fix uses ``int16`` (range
-[-32768, 32767]) which fully contains [-448, 448] and preserves sign.
+Fix notes
+---------
+* Simulated FP8 quantize: the previous code cast the scaled tensor to
+  ``torch.uint8``.  ``uint8`` is unsigned (range 0–255); casting a float in
+  ``[-448, 448]`` to ``uint8`` is undefined — negative values become 0 via
+  C-style truncation, destroying all negative activations.  The fix uses
+  ``torch.int16`` (range −32768…32767), which safely covers the full E4M3
+  dynamic range ``[-448, 448]`` after rounding.  The dequantize path already
+  called ``.float()`` before dividing, so no further changes are needed there.
 """
 
 from __future__ import annotations
 
 import logging
 import warnings
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -53,12 +55,6 @@ _FP8_E4M3_MIN: float = -448.0
 # to decide whether a simulated-FP8 path is acceptable.
 _NATIVE_FP8_DTYPE: Optional[torch.dtype] = getattr(torch, "float8_e4m3fn", None)
 
-# Storage dtype for simulated FP8.  int16 covers [-32768, 32767] which fully
-# contains the FP8 E4M3 dynamic range [-448, 448] and preserves sign.
-# uint8 (the previous choice) mapped negative values to 0, corrupting half
-# the dynamic range.
-_SIM_FP8_STORAGE_DTYPE: torch.dtype = torch.int16
-
 
 def _has_native_fp8() -> bool:
     """Return ``True`` if the current PyTorch build exposes float8_e4m3fn."""
@@ -81,7 +77,7 @@ class FP8ActivationStorage:
 
     Complexity
     ----------
-    * ``quantize``  — *O(n)* time, *O(n/2)* space (FP8 ≈ half of FP16).
+    * ``quantize``   — *O(n)* time, *O(n/2)* space (FP8 ≈ half of FP16).
     * ``dequantize`` — *O(n)* time, *O(n)* space (restores full dtype).
     """
 
@@ -89,8 +85,7 @@ class FP8ActivationStorage:
         self._use_native: bool = _has_native_fp8() and not force_simulated
         if not self._use_native:
             logger.info(
-                "Native FP8 E4M3 unavailable — using simulated (clamp+scale) path "
-                "with int16 storage to preserve negative activations."
+                "Native FP8 E4M3 unavailable — using simulated (clamp+scale) path."
             )
 
     # -- public API ---------------------------------------------------------
@@ -106,13 +101,23 @@ class FP8ActivationStorage:
         Returns
         -------
         quantized : torch.Tensor
-            FP8 (native) or int16 (simulated) tensor.
+            FP8 (or int16 if simulated) tensor.
         scale : torch.Tensor
             Scalar multiplicative scale factor stored in FP32.
 
         Complexity
         ----------
         Time *O(n)*, space *O(n / 2)*.
+
+        Note on simulated path
+        ----------------------
+        The scaled values lie in ``[-448, 448]``.  We store them as
+        ``torch.int16`` (range ``[-32768, 32767]``) rather than ``uint8``
+        (range ``[0, 255]``).  ``uint8`` is unsigned — casting a negative
+        float to ``uint8`` produces 0 in PyTorch (C-style truncation after
+        modular reduction), silently zeroing all negative activations and
+        destroying the dynamic range.  ``int16`` covers ``[-448, 448]`` after
+        rounding without loss.
         """
         amax = tensor.abs().amax().clamp(min=1e-12)
         scale = torch.tensor(
@@ -123,17 +128,11 @@ class FP8ActivationStorage:
             assert _NATIVE_FP8_DTYPE is not None
             quantized = (tensor.float() * scale).to(_NATIVE_FP8_DTYPE)
         else:
-            # Software fallback: scale → clamp to FP8 E4M3 range → round to
-            # nearest integer → store as int16.
-            #
-            # int16 range [-32768, 32767] fully contains [-448, 448] so no
-            # information is lost by the storage dtype.  The previous uint8
-            # cast silently zeroed every negative value because uint8 cannot
-            # represent negatives, corrupting half the dynamic range.
+            # Software fallback: scale → clamp → round → store as int16.
+            # int16 range [-32768, 32767] safely covers the E4M3 range
+            # [-448, 448] after rounding to nearest integer.
             scaled = tensor.float() * scale
-            quantized = scaled.clamp(_FP8_E4M3_MIN, _FP8_E4M3_MAX).round().to(
-                _SIM_FP8_STORAGE_DTYPE
-            )
+            quantized = scaled.clamp(_FP8_E4M3_MIN, _FP8_E4M3_MAX).round().to(torch.int16)
 
         return quantized, scale
 
@@ -145,8 +144,7 @@ class FP8ActivationStorage:
         Parameters
         ----------
         quantized : torch.Tensor
-            FP8 (native) or int16 (simulated) tensor produced by
-            :meth:`quantize`.
+            FP8 (or int16) tensor produced by :meth:`quantize`.
         scale : torch.Tensor
             Scale factor produced alongside *quantized*.
         dtype : torch.dtype, optional
@@ -160,12 +158,13 @@ class FP8ActivationStorage:
         ----------
         Time *O(n)*, space *O(n)*.
         """
+        # .float() correctly handles both native FP8 and int16 paths.
         return (quantized.float() / scale).to(dtype)
 
     # -- dunder -------------------------------------------------------------
 
     def __repr__(self) -> str:
-        backend = "native-fp8-e4m3" if self._use_native else "simulated-fp8-int16"
+        backend = "native-fp8-e4m3" if self._use_native else "simulated-fp8"
         return f"FP8ActivationStorage(backend={backend!r})"
 
 
