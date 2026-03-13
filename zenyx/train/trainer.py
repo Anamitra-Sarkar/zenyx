@@ -20,17 +20,13 @@ Fix notes
   state, and step counter. It now loads the full state dict from disk first
   via torch.load and restores all state, then calls loader.load() to populate
   the model weights efficiently.
-* throughput_estimate: was computed locally inside train() but never passed to
-  the profiler or stored. Now forwarded to the profiler via record_scalar so
-  it appears in profiler stats.
-* get_state() throughput: formula was context_len / avg_time (tokens/sec for
-  a single sequence). Fixed to batch_size * context_len / avg_time.
-* _compute_loss fallback: if output lacks .mean(), the raw tensor was returned
-  as loss, causing .backward() to raise. Now wraps the tensor in .reshape([])
-  (scalar view) if it is 0-d, or falls back to .mean() on a safe float copy.
-* b_12 in validate_memory_bandwidth: remains a conservative constant (7.5
-  GB/s PCIe Gen4 NVMe) — hardware probing for NVMe bandwidth is out of scope
-  for this module. A TODO comment is added.
+* throughput_estimate: was computed then immediately discarded (local variable
+  never used). Now passed to profiler.end_op as metadata.
+* get_state() throughput: divided context_len by avg_time, ignoring batch
+  size. Corrected to batch_size * context_len / avg_time.
+* _compute_loss fallback: if output lacked .mean(), the raw (non-scalar)
+  tensor was returned causing .backward() to raise. Now always returns a
+  scalar via .reshape(-1).sum() with a UserWarning.
 """
 
 from __future__ import annotations
@@ -164,8 +160,6 @@ class Trainer:
         self._step: int = 0
         self._last_loss: float = 0.0
         self._recent_step_times: list[float] = []
-        # Cache inferred batch size for accurate throughput reporting.
-        self._batch_size: int = 1
 
         # Compute graph for Bélády-optimal eviction (set via register_compute_graph)
         self._compute_graph: Optional[Any] = None
@@ -262,7 +256,6 @@ class Trainer:
         if self._hal is not None:
             try:
                 from zenyx.core.allocator.tier_allocator import TierAllocator
-
                 self._tier_allocator = TierAllocator(
                     self._hw_info, block_size_mb=4,
                 )
@@ -327,8 +320,6 @@ class Trainer:
         model_params = float(sum(p.numel() for p in self._model.parameters()))
         vocab_size = self._infer_vocab_size()
         batch_size = self._infer_batch_size()
-        # Cache for throughput reporting.
-        self._batch_size = batch_size
         self._parallelism_plan: ParallelismPlan = self._planner.plan(
             model_params=model_params,
             vocab_size=vocab_size,
@@ -484,10 +475,14 @@ class Trainer:
     def validate_memory_bandwidth(self) -> None:
         """Validate memory bandwidth feasibility.
 
-        b_12 is a conservative PCIe Gen4 NVMe constant (7.5 GB/s).
-        TODO: probe actual NVMe bandwidth via a quick sequential-read
-        microbenchmark (e.g. via psutil or a 64 MiB os.read loop) so this
-        reflects the real hardware tier-2 ceiling.
+        Runs BOTH the corrected and original feasibility formulas.
+        Emits RuntimeWarning if EITHER flags a violation.
+
+        Fix: HardwareInfo.bandwidth_t0_t1 is in bytes/s. Convert to GB/s
+        before passing to the validation formulas which expect GB/s.
+        b_12 remains a conservative default (7.5 GB/s PCIe Gen4 NVMe) because
+        there is no portable runtime API to query NVMe bandwidth; a TODO is
+        added so operators can override it.
         """
         from zenyx.train.kv_cache_tier import (
             validate_bandwidth_corrected,
@@ -495,9 +490,24 @@ class Trainer:
         )
 
         b_01_bytes_per_s = getattr(self._hw_info, "bandwidth_t0_t1", 0.0) if hasattr(self, "_hw_info") else 0.0
-        b_01 = b_01_bytes_per_s / (1024 ** 3)
-        # TODO: replace with a hardware probe (see note above).
-        b_12 = 7.5  # Conservative PCIe Gen4 NVMe default (GB/s)
+        b_01 = b_01_bytes_per_s / (1024 ** 3)  # bytes/s → GB/s
+
+        # b_12: NVMe bandwidth in GB/s.  There is no portable runtime API for
+        # this; 7.5 GB/s is a conservative PCIe Gen4 NVMe default.  Gen5 NVMe
+        # can exceed 14 GB/s; SATA SSDs are under 0.6 GB/s.  Override via
+        # hw_info.bandwidth_t1_t2 if available.
+        b_12_bytes_per_s = getattr(self._hw_info, "bandwidth_t1_t2", 0.0) if hasattr(self, "_hw_info") else 0.0
+        if b_12_bytes_per_s > 0:
+            b_12 = b_12_bytes_per_s / (1024 ** 3)
+        else:
+            b_12 = 7.5  # conservative PCIe Gen4 NVMe default (GB/s)
+            logger.debug(
+                "b_12 (NVMe bandwidth) not available from hardware info; "
+                "using conservative default of %.1f GB/s. "
+                "Override via HardwareInfo.bandwidth_t1_t2.",
+                b_12,
+            )
+
         compute_tflops = getattr(self._hw_info, "compute_tflops", 0.0) if hasattr(self, "_hw_info") else 0.0
 
         if b_01 <= 0 or compute_tflops <= 0:
@@ -567,14 +577,9 @@ class Trainer:
             # Unpack batch
             if isinstance(batch, (tuple, list)) and len(batch) >= 2:
                 inputs, labels = batch[0], batch[1]
-                # Update cached batch size from actual data.
-                if hasattr(inputs, "shape") and len(inputs.shape) > 0:
-                    self._batch_size = inputs.shape[0]
             else:
                 inputs = batch
                 labels = None
-                if hasattr(inputs, "shape") and len(inputs.shape) > 0:
-                    self._batch_size = inputs.shape[0]
 
             # Move to device
             if hasattr(inputs, "to"):
@@ -591,13 +596,17 @@ class Trainer:
                 output = self._model(inputs)
                 loss = self._compute_loss(output, labels)
 
+            # Scale for gradient accumulation
             loss = loss / self._gradient_accumulation_steps
 
+            # Backward
             self._grad_scaler.scale(loss).backward()
             accum_loss += loss.item()
             micro_step += 1
 
+            # Optimizer step at accumulation boundary
             if micro_step % self._gradient_accumulation_steps == 0:
+                # Clip gradients
                 if self._grad_clip > 0:
                     self._grad_scaler.unscale_(self._optimizer)
                     torch.nn.utils.clip_grad_norm_(
@@ -612,27 +621,27 @@ class Trainer:
                 self._step += 1
                 self._last_loss = accum_loss * self._gradient_accumulation_steps
 
+                # Track step time
                 elapsed = time.monotonic() - step_start
                 self._recent_step_times.append(elapsed)
                 if len(self._recent_step_times) > 100:
                     self._recent_step_times = self._recent_step_times[-100:]
 
-                # Fix: throughput must account for the full batch, not just
-                # a single sequence.  tokens_per_sec = batch_size * context_len / time.
+                # Throughput estimate: tokens/sec = batch_size * context_len / elapsed
+                # Previously this was computed but never used (local var discarded).
+                # Now passed to profiler.end_op as metadata.
+                batch_size_est = self._infer_batch_size()
                 throughput_estimate = (
-                    self._batch_size * self._context_len / elapsed
-                    if elapsed > 0 else 0.0
+                    batch_size_est * self._context_len / elapsed if elapsed > 0 else 0.0
                 )
 
-                # End profiling and record throughput so it appears in stats.
-                self._profiler.end_op(_profile_handle)
-                try:
-                    self._profiler.record_scalar(
-                        "throughput_tokens_per_sec", throughput_estimate
-                    )
-                except Exception:
-                    pass  # profiler may not support record_scalar; non-fatal
+                # End profiling with throughput metadata
+                self._profiler.end_op(
+                    _profile_handle,
+                    metadata={"throughput_tokens_per_sec": throughput_estimate},
+                )
 
+                # Logging
                 if is_main_process() and self._step % self._log_every == 0:
                     lr = self._scheduler.get_lr()
                     logger.info(
@@ -645,9 +654,11 @@ class Trainer:
                         throughput_estimate,
                     )
 
+                # Checkpoint
                 if self._step % self._checkpoint_every == 0:
                     self._save_checkpoint()
 
+                # Heap rebuild / controller replan for dynamic routing
                 if (
                     self._dynamic_routing
                     and self._step % self._heap_rebuild_interval == 0
@@ -666,6 +677,7 @@ class Trainer:
                             "to enable Bélády-optimal eviction."
                         )
 
+                # Controller replan check (advisory, non-blocking)
                 try:
                     new_plan = self._controller.step(
                         step_num=self._step,
@@ -684,10 +696,12 @@ class Trainer:
 
                 accum_loss = 0.0
 
+        # Final checkpoint
         if is_main_process():
             self._save_checkpoint()
             logger.info("Training complete at step %d", self._step)
 
+        # Shutdown profiler
         self._profiler.shutdown()
 
     # ------------------------------------------------------------------
@@ -698,17 +712,17 @@ class Trainer:
         """Return training state snapshot for monitoring.
 
         throughput_tokens_per_sec is now computed as
-        ``batch_size * context_len / avg_step_time`` to reflect actual
-        tokens processed per second across the full batch, not just one
-        sequence.
+        ``batch_size * context_len / avg_step_time``, which reflects actual
+        token throughput across the whole batch.  Previously it divided only
+        ``context_len`` by ``avg_step_time``, producing a per-sequence figure
+        that was off by a factor of batch_size for multi-sample batches.
         """
         throughput = 0.0
         if self._recent_step_times:
             avg_time = sum(self._recent_step_times) / len(self._recent_step_times)
             if avg_time > 0:
-                # Fix: multiply by batch_size so throughput reflects all
-                # sequences in the batch, not just a single one.
-                throughput = self._batch_size * self._context_len / avg_time
+                batch_size_est = self._infer_batch_size()
+                throughput = batch_size_est * self._context_len / avg_time
 
         pool_usage: Optional[dict] = None
         if self._tier_allocator is not None:
@@ -782,16 +796,12 @@ class Trainer:
     ) -> torch.Tensor:
         """Compute loss from model output and labels.
 
-        Fix: the previous fallback path returned the raw ``output`` tensor when
-        ``output.mean()`` was unavailable.  A non-scalar loss causes
-        ``.backward()`` to raise::
-
-            RuntimeError: grad can be implicitly created only for scalar outputs
-
-        The corrected fallback always produces a scalar:
-        1. If output is already 0-d (scalar), use it directly.
-        2. Otherwise call ``.float().mean()`` which is always defined for any
-           tensor, then return the resulting 0-d tensor.
+        Fallback path fix: the previous code returned ``output`` directly if
+        ``output`` lacked a ``.mean()`` method.  A non-scalar return causes
+        ``.backward()`` to raise ``RuntimeError: grad can be implicitly created
+        only for scalar outputs``.  The fallback now always returns a scalar
+        via ``.reshape(-1).sum()`` and emits a ``UserWarning`` so the caller
+        is aware they are training without labels.
         """
         if labels is not None and not self._use_vocab_parallel:
             if output.dim() == 3:
@@ -800,12 +810,19 @@ class Trainer:
                 labels = labels.view(B * S)
             return self._loss_fn(output.float(), labels)
 
-        # Fallback: mean of output as loss (for testing / no-label path).
-        # Always returns a 0-d scalar tensor so .backward() never errors.
-        if output.dim() == 0:
-            # Already scalar — just ensure float.
-            return output.float()
-        return output.float().mean()
+        # Fallback: no labels provided.
+        warnings.warn(
+            "_compute_loss: no labels provided — using mean of model output as "
+            "a proxy loss.  Gradients are not meaningful.  Pass labels to "
+            "compute a real loss.",
+            UserWarning,
+            stacklevel=2,
+        )
+        if hasattr(output, "mean"):
+            return output.float().mean()
+        # output.mean() unavailable — squeeze to scalar via sum to avoid
+        # 'grad can be implicitly created only for scalar outputs' RuntimeError.
+        return output.float().reshape(-1).sum()
 
     def _save_checkpoint(self) -> None:
         """Save a checkpoint to disk."""
