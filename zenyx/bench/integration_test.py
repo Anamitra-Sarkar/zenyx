@@ -189,6 +189,203 @@ def test_vocab_parallel_single_device() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Phase 5: Agent Integration Tests
+# ---------------------------------------------------------------------------
+
+
+def test_async_profiler_records() -> None:
+    """Test that AsyncProfiler accepts step records without crashing."""
+    from zenyx.core.agent.profiler import AsyncProfiler
+
+    profiler = AsyncProfiler(enabled=True)
+    # Record a few operations
+    for i in range(5):
+        handle = profiler.start_op(f"op_{i}")
+        profiler.end_op(handle)
+    # Allow background thread to flush
+    import time
+    time.sleep(0.6)
+    timings = profiler.get_timings()
+    # All ops should have been recorded
+    assert len(timings) == 5, f"Expected 5 ops, got {len(timings)}"
+    for name, timing in timings.items():
+        assert timing.count >= 1, f"Op {name} has count={timing.count}"
+    profiler.shutdown()
+
+
+def test_parallelism_planner_cpu() -> None:
+    """Test that ParallelismPlanner returns a valid plan for CPU hardware."""
+    from zenyx.core.hal.detector import detect_hardware
+    from zenyx.core.agent.planner import ParallelismPlanner
+    from zenyx.ops.comm.topology import Topology
+
+    hw = detect_hardware()
+    topo = Topology()
+    planner = ParallelismPlanner(hw, topo)
+    plan = planner.plan(
+        model_params=1e6,
+        vocab_size=32000,
+        context_len=512,
+        batch_size=2,
+    )
+    assert plan.tp_degree >= 1
+    assert plan.pp_degree >= 1
+    assert plan.dp_degree >= 1
+    assert plan.ring_degree >= 1
+    assert plan.schedule_type in ("1f1b", "braided", "gpipe")
+
+
+def test_training_controller_step() -> None:
+    """Test that TrainingController.step() runs without crashing."""
+    from zenyx.core.hal.detector import detect_hardware
+    from zenyx.core.agent.profiler import AsyncProfiler
+    from zenyx.core.agent.planner import ParallelismPlanner
+    from zenyx.core.agent.controller import TrainingController
+    from zenyx.ops.comm.topology import Topology
+
+    hw = detect_hardware()
+    topo = Topology()
+    profiler = AsyncProfiler(enabled=True)
+    planner = ParallelismPlanner(hw, topo)
+
+    controller = TrainingController(
+        planner=planner,
+        profiler=profiler,
+        replan_interval=5,
+        model_params=1e6,
+        vocab_size=32000,
+        batch_size=2,
+    )
+
+    # Run a few steps
+    for i in range(10):
+        result = controller.step(step_num=i, loss=1.0 - i * 0.05, context_len=512)
+
+    stats = controller.get_training_stats()
+    assert stats.steps_completed == 9
+    profiler.shutdown()
+
+
+def test_trainer_agent_state() -> None:
+    """Test that Trainer.get_state() includes agent data."""
+    from zenyx.train.trainer import Trainer
+
+    model = make_tiny_model()
+    dataloader = make_fake_dataloader(steps=3)
+    trainer = Trainer(
+        model,
+        dataloader,
+        total_steps=1,
+        warmup_steps=0,
+        log_every=1,
+        checkpoint_dir="/tmp/zenyx_test_ckpt",
+        checkpoint_every=100,
+        dtype="float32",
+        selective_activation_checkpoint=False,
+    )
+    state = trainer.get_state()
+    assert "parallelism_plan" in state
+    assert "profiler_stats" in state
+    # Plan should have valid structure
+    plan = state["parallelism_plan"]
+    assert plan is not None
+    assert "tp_degree" in plan
+    assert "dp_degree" in plan
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: Fast Model Loader Tests
+# ---------------------------------------------------------------------------
+
+
+def test_loader_config_defaults() -> None:
+    """Test LoaderConfig construction with defaults."""
+    from zenyx.loader.loader_config import LoaderConfig
+
+    config = LoaderConfig()
+    assert config.num_buffers == 3
+    assert config.prefetch_bytes == 512 * 1024 * 1024
+    assert config.use_gpu_direct is True
+    assert config.dtype == "bfloat16"
+    assert config.max_load_time_seconds == 30.0
+    assert config.verify_integrity is True
+
+
+def test_model_loader_construction() -> None:
+    """Test ModelLoader construction on CPU hardware."""
+    from zenyx.core.hal.detector import detect_hardware
+    from zenyx.loader.loader import ModelLoader
+
+    hw = detect_hardware()
+    loader = ModelLoader(hal=None, hw_info=hw)
+    assert loader is not None
+    stats = loader.get_stats()
+    assert stats.bytes_loaded == 0  # No load yet
+
+
+def test_load_model_roundtrip() -> None:
+    """Test load_model on a tiny 2-layer model saved with torch.save to a temp file."""
+    import tempfile
+    import os
+
+    from zenyx.loader.loader import load_model
+
+    # Create a tiny model and save it
+    model = make_tiny_model(vocab_size=100, d_model=32, n_layers=2, n_heads=2)
+    state = {"model_state_dict": model.state_dict()}
+    with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
+        torch.save(state, f.name)
+        tmp_path = f.name
+
+    try:
+        # Create a fresh model with same architecture and load
+        fresh_model = make_tiny_model(vocab_size=100, d_model=32, n_layers=2, n_heads=2)
+
+        # Verify weights differ before load
+        old_param = next(iter(fresh_model.parameters())).clone()
+        loaded_model = load_model(tmp_path, fresh_model, dtype="float32")
+        assert loaded_model is fresh_model  # Same instance
+
+        # Verify weights were actually loaded
+        for name, param in model.named_parameters():
+            loaded_param = dict(loaded_model.named_parameters())[name]
+            assert torch.allclose(param.float(), loaded_param.float(), atol=1e-4), (
+                f"Parameter {name} mismatch after load"
+            )
+    finally:
+        os.unlink(tmp_path)
+
+
+def test_loader_stats_populated() -> None:
+    """Test that LoaderStats is populated correctly after a load."""
+    import tempfile
+    import os
+
+    from zenyx.core.hal.detector import detect_hardware
+    from zenyx.loader.loader import ModelLoader
+
+    model = make_tiny_model(vocab_size=100, d_model=32, n_layers=2, n_heads=2)
+    state = {"model_state_dict": model.state_dict()}
+    with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
+        torch.save(state, f.name)
+        tmp_path = f.name
+
+    try:
+        hw = detect_hardware()
+        loader = ModelLoader(hal=None, hw_info=hw, dtype="float32")
+        fresh_model = make_tiny_model(vocab_size=100, d_model=32, n_layers=2, n_heads=2)
+        loader.load(tmp_path, fresh_model)
+
+        stats = loader.get_stats()
+        assert stats.bytes_loaded > 0
+        assert stats.elapsed_seconds > 0
+        assert stats.throughput_mb_per_sec > 0
+        assert stats.num_buffers_used == 3
+    finally:
+        os.unlink(tmp_path)
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -201,6 +398,16 @@ if __name__ == "__main__":
         test_cosine_schedule,
         test_ring_attention_single_device,
         test_vocab_parallel_single_device,
+        # Phase 5: Agent integration
+        test_async_profiler_records,
+        test_parallelism_planner_cpu,
+        test_training_controller_step,
+        test_trainer_agent_state,
+        # Phase 6: Fast model loader
+        test_loader_config_defaults,
+        test_model_loader_construction,
+        test_load_model_roundtrip,
+        test_loader_stats_populated,
     ]
     passed = 0
     failed = 0

@@ -48,7 +48,14 @@ _DTYPE_MAP: Dict[str, torch.dtype] = {
 
 
 class Trainer:
-    """Full-stack LLM trainer with automatic hardware detection and memory management."""
+    """Full-stack LLM trainer with automatic hardware detection and memory management.
+
+    Integrates the agent feedback loop (AsyncProfiler → ParallelismPlanner →
+    TrainingController) for autonomous replanning and the fast model loader
+    for checkpoint loading.
+
+    Time: O(steps × (forward + backward + optimizer)).  Space: O(model + activations).
+    """
 
     def __init__(
         self,
@@ -85,6 +92,8 @@ class Trainer:
         gradient_accumulation_steps: int = 1,
         selective_activation_checkpoint: bool = True,
         checkpoint_every_nth_layer: int = 4,
+        # Loader
+        loader_config: Optional[Any] = None,
     ) -> None:
         self._model = model
         self._dataloader = dataloader
@@ -97,11 +106,15 @@ class Trainer:
         self._dynamic_routing = dynamic_routing
         self._heap_rebuild_interval = heap_rebuild_interval
         self._context_len = context_len
+        self._loader_config = loader_config
 
         # Training state
         self._step: int = 0
         self._last_loss: float = 0.0
         self._recent_step_times: list[float] = []
+
+        # Compute graph for Bélády-optimal eviction (set via register_compute_graph)
+        self._compute_graph: Optional[Any] = None
 
         # --- Step 1: Hardware detection ---
         from zenyx.core.hal.detector import detect_hardware, HardwareInfo
@@ -150,10 +163,8 @@ class Trainer:
         elif self._topo_info.backend == "xla_ici":
             self._backend = "tpu"
 
-        # --- Step 4: Create HAL, MemoryPool, ReuseHeap, TierAllocator ---
+        # --- Step 4: Create HAL + TierAllocator (manages pool and heap internally) ---
         self._hal: Any = None
-        self._pool: Any = None
-        self._reuse_heap: Any = None
         self._tier_allocator: Any = None
 
         try:
@@ -166,20 +177,13 @@ class Trainer:
 
         if self._hal is not None:
             try:
-                from zenyx.core.allocator.mem_pool import MemoryPool
-                from zenyx.core.allocator.reuse_heap import ReuseHeap
                 from zenyx.core.allocator.tier_allocator import TierAllocator
 
-                self._pool = MemoryPool(
-                    self._hal,
-                    self._hw_info,
-                    t1_capacity=int(t1_capacity_gb * 1024**3),
-                    t2_capacity=int(t2_capacity_gb * 1024**3),
+                self._tier_allocator = TierAllocator(
+                    self._hw_info, block_size_mb=4,
                 )
-                self._reuse_heap = ReuseHeap()
-                self._tier_allocator = TierAllocator(self._pool, self._reuse_heap)
             except Exception as e:
-                logger.debug("Memory pool init skipped: %s", e)
+                logger.debug("TierAllocator init skipped: %s", e)
 
         # --- Step 5: Select attention kernel ---
         self._attention_kernel_name = "flash_cpu"
@@ -225,11 +229,45 @@ class Trainer:
         self._amp_dtype = compute_dtype
         self._use_amp = dtype != "float32" and self._backend == "cuda"
 
-        # --- Step 12: Resume from checkpoint ---
+        # --- Step 12: Agent integration (profiler, planner, controller) ---
+        from zenyx.core.agent.profiler import AsyncProfiler
+        from zenyx.core.agent.planner import ParallelismPlanner, ParallelismPlan
+        from zenyx.core.agent.controller import TrainingController
+        from zenyx.ops.comm.topology import Topology
+
+        self._profiler = AsyncProfiler(enabled=True)
+
+        # Build a Topology stub from TopologyInfo for the planner
+        topo = Topology()
+        self._planner = ParallelismPlanner(self._hw_info, topo)
+
+        # Compute initial parallelism plan
+        model_params = float(sum(p.numel() for p in self._model.parameters()))
+        vocab_size = self._infer_vocab_size()
+        batch_size = self._infer_batch_size()
+        self._parallelism_plan: ParallelismPlan = self._planner.plan(
+            model_params=model_params,
+            vocab_size=vocab_size,
+            context_len=context_len,
+            batch_size=batch_size,
+        )
+        logger.info("Initial parallelism plan: %s", self._parallelism_plan)
+
+        # Training controller
+        self._controller = TrainingController(
+            planner=self._planner,
+            profiler=self._profiler,
+            replan_interval=heap_rebuild_interval,
+            model_params=model_params,
+            vocab_size=vocab_size,
+            batch_size=batch_size,
+        )
+
+        # --- Step 13: Resume from checkpoint ---
         if resume_from is not None:
             self._load_checkpoint(resume_from)
 
-        # --- Step 13: Loss function ---
+        # --- Step 14: Loss function ---
         self._loss_fn: Any = nn.CrossEntropyLoss()
         self._use_vocab_parallel = False
         if get_world_size() > 1:
@@ -242,11 +280,32 @@ class Trainer:
                 pass
 
         logger.info(
-            "Zenyx Trainer initialized. Hardware: %s. Attention: %s. Pool: %s",
+            "Zenyx Trainer initialized. Hardware: %s. Attention: %s. Allocator: %s",
             self._backend,
             self._attention_kernel_name,
-            "active" if self._pool is not None else "none",
+            "active" if self._tier_allocator is not None else "none",
         )
+
+    # ------------------------------------------------------------------
+    # Public methods
+    # ------------------------------------------------------------------
+
+    def register_compute_graph(self, graph: Any) -> None:
+        """Register a compute graph for Bélády-optimal eviction scheduling.
+
+        Users can provide graph information for optimal eviction planning
+        in dynamic-routing / MoE models.
+
+        Time: O(G + N log N) where G = graph ops, N = tracked blocks.
+        Space: O(G).
+
+        Args:
+            graph: A :class:`ComputeGraph` instance.
+        """
+        self._compute_graph = graph
+        if self._tier_allocator is not None:
+            self._tier_allocator.register_compute_graph(graph)
+            logger.info("Compute graph registered with TierAllocator")
 
     # ------------------------------------------------------------------
     # Training loop
@@ -269,8 +328,10 @@ class Trainer:
               - Log if log_every
               - Checkpoint if checkpoint_every
               - If dynamic_routing and step % heap_rebuild_interval == 0:
-                  trigger reuse_heap.rebuild_async(updated_graph)
+                  trigger graph rebuild or controller replan
         2. Final checkpoint save
+
+        Time: O(steps × (forward + backward + optimizer)).
         """
         self._model.train()
 
@@ -282,6 +343,9 @@ class Trainer:
                 break
 
             step_start = time.monotonic()
+
+            # Start profiling the training step
+            _profile_handle = self._profiler.start_op("train_step")
 
             # Unpack batch
             if isinstance(batch, (tuple, list)) and len(batch) >= 2:
@@ -317,8 +381,7 @@ class Trainer:
             if micro_step % self._gradient_accumulation_steps == 0:
                 # Clip gradients
                 if self._grad_clip > 0:
-                    if self._grad_scaler._enabled and self._grad_scaler._scaler is not None:
-                        self._grad_scaler._scaler.unscale_(self._optimizer)
+                    self._grad_scaler.unscale_(self._optimizer)
                     torch.nn.utils.clip_grad_norm_(
                         self._model.parameters(), self._grad_clip
                     )
@@ -337,6 +400,12 @@ class Trainer:
                 if len(self._recent_step_times) > 100:
                     self._recent_step_times = self._recent_step_times[-100:]
 
+                # Estimate throughput for profiler
+                throughput_estimate = self._context_len / elapsed if elapsed > 0 else 0.0
+
+                # End profiling the training step
+                self._profiler.end_op(_profile_handle)
+
                 # Logging
                 if is_main_process() and self._step % self._log_every == 0:
                     lr = self._scheduler.get_lr()
@@ -352,16 +421,41 @@ class Trainer:
                 if self._step % self._checkpoint_every == 0:
                     self._save_checkpoint()
 
-                # Heap rebuild for dynamic routing
+                # Heap rebuild / controller replan for dynamic routing
                 if (
                     self._dynamic_routing
-                    and self._reuse_heap is not None
                     and self._step % self._heap_rebuild_interval == 0
                 ):
-                    try:
-                        self._reuse_heap.rebuild_async(None)
-                    except Exception as e:
-                        logger.debug("Heap rebuild skipped: %s", e)
+                    if self._compute_graph is not None and self._tier_allocator is not None:
+                        try:
+                            self._tier_allocator.register_compute_graph(
+                                self._compute_graph,
+                            )
+                        except Exception as e:
+                            logger.debug("Heap rebuild skipped: %s", e)
+                    else:
+                        logger.debug(
+                            "Heap rebuild skipped: no compute graph registered "
+                            "(dynamic_routing=True). Call register_compute_graph() "
+                            "to enable Bélády-optimal eviction."
+                        )
+
+                # Controller replan check (advisory, non-blocking)
+                try:
+                    new_plan = self._controller.step(
+                        step_num=self._step,
+                        loss=self._last_loss,
+                        context_len=self._context_len,
+                    )
+                    if new_plan is not None:
+                        self._parallelism_plan = new_plan
+                        logger.warning(
+                            "Replanning mid-training at step %d: %s",
+                            self._step,
+                            new_plan,
+                        )
+                except Exception as e:
+                    logger.debug("Controller step skipped: %s", e)
 
                 accum_loss = 0.0
 
@@ -369,6 +463,9 @@ class Trainer:
         if is_main_process():
             self._save_checkpoint()
             logger.info("Training complete at step %d", self._step)
+
+        # Shutdown profiler
+        self._profiler.shutdown()
 
     # ------------------------------------------------------------------
     # State inspection
@@ -384,6 +481,10 @@ class Trainer:
         - memory_usage: pool.usage() snapshot
         - topology: topo info
         - throughput_tokens_per_sec: computed from recent steps
+        - parallelism_plan: current parallelism plan
+        - profiler_stats: profiler timing stats
+
+        Time: O(K) where K = profiled ops.  Space: O(K).
         """
         throughput = 0.0
         if self._recent_step_times:
@@ -393,11 +494,35 @@ class Trainer:
                 throughput = self._context_len / avg_time
 
         pool_usage: Optional[dict] = None
-        if self._pool is not None and hasattr(self._pool, "usage"):
-            try:
-                pool_usage = self._pool.usage()
-            except Exception:
-                pass
+        if self._tier_allocator is not None:
+            pool = getattr(self._tier_allocator, "_pool", None)
+            if pool is not None and hasattr(pool, "usage"):
+                try:
+                    pool_usage = pool.usage()
+                except Exception:
+                    pass
+
+        # Profiler stats
+        profiler_stats: Optional[dict] = None
+        try:
+            timings = self._profiler.get_timings()
+            profiler_stats = {
+                k: {"avg_ms": v.avg_ms, "count": v.count}
+                for k, v in timings.items()
+            }
+        except Exception:
+            pass
+
+        # Parallelism plan
+        plan_dict: Optional[dict] = None
+        if self._parallelism_plan is not None:
+            plan_dict = {
+                "tp_degree": self._parallelism_plan.tp_degree,
+                "pp_degree": self._parallelism_plan.pp_degree,
+                "dp_degree": self._parallelism_plan.dp_degree,
+                "ring_degree": self._parallelism_plan.ring_degree,
+                "schedule_type": self._parallelism_plan.schedule_type,
+            }
 
         return {
             "step": self._step,
@@ -411,11 +536,37 @@ class Trainer:
                 "s_min_tokens": self._topo_info.s_min_tokens,
             },
             "throughput_tokens_per_sec": throughput,
+            "parallelism_plan": plan_dict,
+            "profiler_stats": profiler_stats,
         }
 
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _infer_vocab_size(self) -> int:
+        """Try to infer vocabulary size from model attributes.
+
+        Time: O(1).
+        """
+        for attr in ("config", "cfg"):
+            cfg = getattr(self._model, attr, None)
+            if cfg is not None:
+                for key in ("vocab_size", "n_vocab", "ntokens"):
+                    val = getattr(cfg, key, None)
+                    if val is not None:
+                        return int(val)
+        return 32000
+
+    def _infer_batch_size(self) -> int:
+        """Try to infer batch size from the dataloader.
+
+        Time: O(1).
+        """
+        bs = getattr(self._dataloader, "batch_size", None)
+        if bs is not None:
+            return int(bs)
+        return 1
 
     def _compute_loss(
         self, output: torch.Tensor, labels: Optional[torch.Tensor]
@@ -455,20 +606,38 @@ class Trainer:
             logger.warning("Checkpoint save failed: %s", e)
 
     def _load_checkpoint(self, path: str) -> None:
-        """Load a checkpoint from disk."""
+        """Load a checkpoint from disk.
+
+        If a loader_config is set, uses the fast ModelLoader for triple-buffered
+        loading. Otherwise falls back to standard torch.load.
+        """
         if not os.path.exists(path):
             logger.warning("Checkpoint not found: %s", path)
             return
 
         try:
-            state = torch.load(path, map_location=self._device, weights_only=False)
-            self._model.load_state_dict(state["model_state_dict"])
-            self._optimizer.load_state_dict(state["optimizer_state_dict"])
-            self._step = state.get("step", 0)
-            # Advance scheduler to match
-            for _ in range(state.get("scheduler_step", 0)):
-                self._scheduler.step()
-            logger.info("Resumed from checkpoint: %s (step %d)", path, self._step)
+            if self._loader_config is not None:
+                from zenyx.loader.loader import ModelLoader
+
+                loader = ModelLoader(
+                    hal=self._hal,
+                    hw_info=self._hw_info,
+                    num_buffers=self._loader_config.num_buffers,
+                    prefetch_bytes=self._loader_config.prefetch_bytes,
+                    use_gpu_direct=self._loader_config.use_gpu_direct,
+                    dtype=self._loader_config.dtype,
+                )
+                self._model = loader.load(path, self._model)
+                logger.info("Loaded checkpoint via fast ModelLoader: %s", path)
+            else:
+                state = torch.load(path, map_location=self._device, weights_only=True)
+                self._model.load_state_dict(state["model_state_dict"])
+                self._optimizer.load_state_dict(state["optimizer_state_dict"])
+                self._step = state.get("step", 0)
+                # Advance scheduler to match
+                for _ in range(state.get("scheduler_step", 0)):
+                    self._scheduler.step()
+                logger.info("Resumed from checkpoint: %s (step %d)", path, self._step)
         except Exception as e:
             logger.warning("Checkpoint load failed: %s", e)
 

@@ -23,7 +23,7 @@ Usage::
 
 from __future__ import annotations
 
-__version__ = "0.4.0"
+__version__ = "0.6.0"
 __all__ = [
     "__version__",
     "Trainer",
@@ -35,6 +35,8 @@ __all__ = [
     "get_world_size",
     "is_main_process",
     "barrier",
+    "ModelLoader",
+    "load_model",
 ]
 
 import logging
@@ -54,6 +56,7 @@ from zenyx.train.distributed_setup import (
     is_main_process,
     barrier,
 )
+from zenyx.loader.loader import ModelLoader, load_model
 
 # Convenience: auto-init distributed on import if env vars suggest it
 # but ONLY if ZENYX_AUTO_INIT_DISTRIBUTED=1 is set
@@ -80,9 +83,11 @@ def _auto_detect_hardware() -> Any:
     return _hardware_info
 
 
-@property  # type: ignore[misc]
-def hardware(self: Any) -> Any:
-    """Module-level property emulation for lazy hardware info."""
+def hardware() -> Any:
+    """Return the detected hardware info. Lazily initialized.
+
+    Time: O(num_devices) on first call, O(1) thereafter.  Space: O(1).
+    """
     return _auto_detect_hardware()
 
 

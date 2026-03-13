@@ -128,8 +128,11 @@ zenyx/
 │   ├── mixed_prec.py  # FP8 E4M3 activation storage
 │   └── checkpoint.py  # Async distributed checkpointing
 ├── loader/
-│   ├── gds_loader.py  # GPU Direct Storage triple-buffering
-│   └── tpu_loader.py  # TPU multi-threaded pread + DMA
+│   ├── loader.py       # Hardware-aware triple-buffered checkpoint loader
+│   ├── loader_config.py # Loader configuration dataclass
+│   ├── stats.py        # Post-load performance statistics
+│   ├── gds_loader.py   # GPU Direct Storage triple-buffering
+│   └── tpu_loader.py   # TPU multi-threaded pread + DMA
 └── bench/
     ├── integration_test.py  # End-to-end integration tests
     ├── memory_budget.py     # Memory budget calculator
@@ -170,6 +173,66 @@ report = memory_budget(
 )
 print(report)
 ```
+
+## Phase 5 — Agent Integration (Autonomous Replanning)
+
+The agent feedback loop runs inside the Trainer and continuously optimises
+parallelism and memory layout without user intervention.
+
+```python
+trainer = zenyx.train(model, dataloader, context_len=131072)
+
+# The Trainer automatically:
+# 1. Profiles every training step via AsyncProfiler (< 1% overhead)
+# 2. Uses ParallelismPlanner to compute TP/PP/DP/Ring degrees at init
+# 3. Runs TrainingController.step() each iteration for advisory replanning
+# 4. Logs plan changes at WARNING level — no manual tuning needed
+
+state = trainer.get_state()
+print(state["parallelism_plan"])  # Current TP/PP/DP/Ring layout
+print(state["profiler_stats"])    # Per-op timing statistics
+```
+
+Key components:
+
+| Component             | Location                          | Purpose                                     |
+| --------------------- | --------------------------------- | ------------------------------------------- |
+| `AsyncProfiler`       | `zenyx/core/agent/profiler.py`    | Lightweight CUDA event profiler             |
+| `ParallelismPlanner`  | `zenyx/core/agent/planner.py`     | Auto-determine TP/PP/DP/Ring degrees        |
+| `TrainingController`  | `zenyx/core/agent/controller.py`  | Replan at curriculum shifts / every N steps  |
+
+## Phase 6 — Fast Model Loader
+
+Hardware-aware triple-buffered checkpoint loading. Automatically selects
+GPU Direct Storage (CUDA), pread + DMA (TPU), or mmap (CPU).
+
+```python
+import zenyx
+
+# One-line fast loading
+model = zenyx.load_model("checkpoint.pt", model, dtype="bfloat16")
+
+# Or via the Trainer with LoaderConfig
+from zenyx.loader import LoaderConfig
+
+trainer = zenyx.train(
+    model,
+    dataloader,
+    resume_from="checkpoint.pt",
+    loader_config=LoaderConfig(
+        num_buffers=3,
+        use_gpu_direct=True,
+        dtype="bfloat16",
+    ),
+)
+```
+
+| Feature              | CUDA                        | TPU              | CPU          |
+| -------------------- | --------------------------- | ---------------- | ------------ |
+| I/O strategy         | GDS / pread + cudaMemcpy    | pread + DMA      | mmap         |
+| Triple-buffering     | ✅                           | ✅ (thread pool)  | N/A          |
+| Rollback on failure  | ✅                           | ✅                | ✅            |
+| Integrity validation | ✅                           | ✅                | ✅            |
 
 ## Installation
 

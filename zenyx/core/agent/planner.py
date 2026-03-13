@@ -29,7 +29,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
-from zenyx.core.hal.base import HardwareInfo
+from zenyx.core.hal.detector import HardwareInfo
 from zenyx.ops.comm.topology import Topology
 
 logger = logging.getLogger("zenyx.agent.planner")
@@ -140,7 +140,7 @@ class ParallelismPlanner:
             Recommended parallelism configuration.
         """
         total_devices = self._hw.device_count
-        per_device_mem_gb = self._hw.per_device_memory_gb
+        per_device_mem_gb = self._hw.per_device_memory_bytes / (1024 ** 3)
 
         # ── Step 1: estimate total memory requirement ────────────────────
         weights_gb = self._estimate_weights_gb(model_params)

@@ -139,6 +139,23 @@ class ZenyxGradScaler:
                 self._growth_tracker = 0
                 logger.debug("Scale increased to %.1f", self._scale)
 
+    def unscale_(self, optimizer: torch.optim.Optimizer) -> None:
+        """Unscale gradients for gradient clipping before :meth:`step`.
+
+        If the CUDA ``GradScaler`` is active, delegates to its ``unscale_``
+        method.  If manual scaling is active or the scaler is disabled, this
+        is a no-op (manual unscaling is handled inside :meth:`step`).
+
+        Args:
+            optimizer: The optimizer whose parameter gradients to unscale.
+
+        Time: O(P) where P = number of parameters.  Space: O(1).
+        """
+        if not self._enabled:
+            return
+        if self._scaler is not None:
+            self._scaler.unscale_(optimizer)
+
     def get_scale(self) -> float:
         """Return the current loss scale."""
         if self._scaler is not None:
