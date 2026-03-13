@@ -244,7 +244,7 @@ class AsyncCheckpointer:
         try:
             with open(meta_path, "r") as f:
                 raw_meta = json.load(f)
-        except (json.JSONDecodeError, ValueError, UnicodeDecodeError) as e:
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
             raise RuntimeError(
                 f"Checkpoint at {meta_path} is corrupted or unreadable: {e}"
             ) from e

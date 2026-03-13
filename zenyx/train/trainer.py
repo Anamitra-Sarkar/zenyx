@@ -158,10 +158,10 @@ class Trainer:
             self._hw_info = HardwareInfo(
                 backend="cpu",
                 device_count=1,
-                per_device_memory_bytes=16 * (1024 ** 3),
+                per_device_memory_bytes=16 * (1024 ** 3),  # 16 GB fallback CPU memory
                 interconnect="none",
-                bandwidth_t0_t1=50.0 * (1024 ** 3),
-                bandwidth_t1_t2=7.0 * (1024 ** 3),
+                bandwidth_t0_t1=50.0 * (1024 ** 3),  # 50 GB/s typical DDR5 bandwidth
+                bandwidth_t1_t2=7.0 * (1024 ** 3),  # 7 GB/s typical NVMe bandwidth
                 compute_tflops=0.0,
                 device_name="CPU (fallback)",
             )
