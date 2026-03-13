@@ -13,6 +13,7 @@ kernel selection.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import time
@@ -148,12 +149,43 @@ class Trainer:
         # --- Step 1: Hardware detection ---
         from zenyx.core.hal.detector import detect_hardware, HardwareInfo
 
-        self._hw_info: HardwareInfo = detect_hardware()
+        try:
+            self._hw_info: HardwareInfo = detect_hardware()
+        except Exception as e:
+            logger.warning(
+                "Hardware detection failed (%s); falling back to CPU defaults.", e,
+            )
+            self._hw_info = HardwareInfo(
+                backend="cpu",
+                device_count=1,
+                per_device_memory_bytes=16 * (1024 ** 3),
+                interconnect="none",
+                bandwidth_t0_t1=50.0 * (1024 ** 3),
+                bandwidth_t1_t2=7.0 * (1024 ** 3),
+                compute_tflops=0.0,
+                device_name="CPU (fallback)",
+            )
 
         # --- Step 2: Topology detection ---
         from zenyx.ops.comm.topology import detect_topology, TopologyInfo
 
-        self._topo_info: TopologyInfo = detect_topology()
+        try:
+            self._topo_info: TopologyInfo = detect_topology()
+        except Exception as e:
+            logger.warning(
+                "Topology detection failed (%s); falling back to single-device defaults.", e,
+            )
+            self._topo_info = TopologyInfo(
+                backend="gloo",
+                interconnect="none",
+                ring_bandwidth_gbps=0.0,
+                world_size=1,
+                local_rank=0,
+                global_rank=0,
+                num_nodes=1,
+                gpus_per_node=0,
+                s_min_tokens=0,
+            )
 
         # --- Log hardware and topology ---
         logger.info(
@@ -327,7 +359,7 @@ class Trainer:
 
         # --- Step 17: Phase 7 — KV Cache Tiering ---
         if kv_tier_config is not None:
-            from zenyx.train.kv_cache_tier import BeladyKVCacheManager
+            from zenyx.train.kv_cache_tier import BeladyKVCacheManager, KVTierConfig
             # Infer num_layers the same way Step 20 does.
             num_layers_kv = 2  # default for tiny models
             for _attr in ("layers", "blocks", "encoder", "decoder"):
@@ -337,7 +369,16 @@ class Trainer:
                     break
             # Infer ring_degree from topology if available.
             ring_degree_kv = max(1, self._topo_info.world_size) if hasattr(self, "_topo_info") else 1
-            cfg = kv_tier_config if isinstance(kv_tier_config, dict) else {}
+            if isinstance(kv_tier_config, KVTierConfig):
+                cfg = vars(kv_tier_config)
+            elif isinstance(kv_tier_config, dict):
+                cfg = kv_tier_config
+            else:
+                logger.warning(
+                    "kv_tier_config has unexpected type %s; using defaults.",
+                    type(kv_tier_config).__name__,
+                )
+                cfg = {}
             self._kv_cache_manager = BeladyKVCacheManager(
                 world_size=cfg.get("world_size", self._topo_info.world_size if hasattr(self, "_topo_info") else 1),
                 num_layers=cfg.get("num_layers", num_layers_kv),
@@ -359,8 +400,17 @@ class Trainer:
 
         # --- Step 19: Phase 9 — Dynamic Ring Curriculum ---
         if curriculum_config is not None:
-            from zenyx.train.ring_curriculum import RingCurriculumManager
-            cfg = curriculum_config if isinstance(curriculum_config, dict) else {}
+            from zenyx.train.ring_curriculum import CurriculumConfig, RingCurriculumManager
+            if isinstance(curriculum_config, CurriculumConfig):
+                cfg = dataclasses.asdict(curriculum_config)
+            elif isinstance(curriculum_config, dict):
+                cfg = curriculum_config
+            else:
+                logger.warning(
+                    "curriculum_config has unexpected type %s; using defaults.",
+                    type(curriculum_config).__name__,
+                )
+                cfg = {}
             self._curriculum_manager = RingCurriculumManager(
                 no_recompile=reshard_no_recompile,
                 **cfg,
@@ -771,7 +821,7 @@ class Trainer:
                 "step": self._step,
                 "model_state_dict": self._model.state_dict(),
                 "optimizer_state_dict": self._optimizer.state_dict(),
-                "scheduler_step": self._scheduler.current_step,
+                "scheduler_state": self._scheduler.state_dict(),
             }
             torch.save(state, path)
             logger.info("Checkpoint saved: %s", path)
@@ -807,9 +857,19 @@ class Trainer:
                 self._model.load_state_dict(state["model_state_dict"])
                 self._optimizer.load_state_dict(state["optimizer_state_dict"])
                 self._step = state.get("step", 0)
-                # Advance scheduler to match
-                for _ in range(state.get("scheduler_step", 0)):
-                    self._scheduler.step()
+                # Restore scheduler state faithfully.
+                if "scheduler_state" in state:
+                    self._scheduler.load_state_dict(state["scheduler_state"])
+                elif "scheduler_step" in state:
+                    # Backward compat: old checkpoint format without full
+                    # scheduler state — fall back to the loop method.
+                    logger.warning(
+                        "Old checkpoint format detected (scheduler_step). "
+                        "Falling back to step-loop scheduler restore. "
+                        "Re-save this checkpoint to upgrade the format."
+                    )
+                    for _ in range(state["scheduler_step"]):
+                        self._scheduler.step()
                 logger.info("Resumed from checkpoint: %s (step %d)", path, self._step)
         except Exception as e:
             logger.warning("Checkpoint load failed: %s", e)
