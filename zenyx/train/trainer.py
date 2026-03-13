@@ -344,6 +344,9 @@ class Trainer:
 
             step_start = time.monotonic()
 
+            # Start profiling the training step
+            _profile_handle = self._profiler.start_op("train_step")
+
             # Unpack batch
             if isinstance(batch, (tuple, list)) and len(batch) >= 2:
                 inputs, labels = batch[0], batch[1]
@@ -400,9 +403,8 @@ class Trainer:
                 # Estimate throughput for profiler
                 throughput_estimate = self._context_len / elapsed if elapsed > 0 else 0.0
 
-                # Record step in profiler (non-blocking)
-                handle = self._profiler.start_op("train_step")
-                self._profiler.end_op(handle)
+                # End profiling the training step
+                self._profiler.end_op(_profile_handle)
 
                 # Logging
                 if is_main_process() and self._step % self._log_every == 0:
@@ -628,7 +630,7 @@ class Trainer:
                 self._model = loader.load(path, self._model)
                 logger.info("Loaded checkpoint via fast ModelLoader: %s", path)
             else:
-                state = torch.load(path, map_location=self._device, weights_only=False)
+                state = torch.load(path, map_location=self._device, weights_only=True)
                 self._model.load_state_dict(state["model_state_dict"])
                 self._optimizer.load_state_dict(state["optimizer_state_dict"])
                 self._step = state.get("step", 0)
