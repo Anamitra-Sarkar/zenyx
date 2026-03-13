@@ -234,7 +234,7 @@ def _ring_permute(x: Any, axis_name: str) -> Any:
     x : jnp.ndarray
         Tensor to send.
     axis_name : str
-        Mesh axis name for the ring.
+        Name of the mesh axis for the ring.
 
     Returns
     -------
@@ -423,6 +423,8 @@ def ring_attention_tpu(
     ------
     ImportError
         If JAX is not installed.
+    TypeError
+        If ``q`` is not a JAX array with a ``.shape`` attribute.
 
     Time complexity:  O(P × S_local² × D) where P = ring size
     Space complexity: O(S_local × H × D)
@@ -432,8 +434,14 @@ def ring_attention_tpu(
             "JAX is not installed. Install with: pip install jax[tpu]"
         )
 
-    # Infer head_dim from the last dimension
-    head_dim = q.shape[-1] if hasattr(q, "shape") else 128
+    # q must be a real JAX array — there is no valid fallback for head_dim.
+    if not hasattr(q, "shape"):
+        raise TypeError(
+            "ring_attention_tpu: q must be a JAX array with a .shape "
+            f"attribute, got {type(q).__name__!r}."
+        )
+    head_dim = q.shape[-1]
+
     attn = RingFlashAttentionTPU(head_dim=head_dim, causal=causal)
     return attn(q, k, v, axis_name=axis_name)
 
@@ -451,5 +459,5 @@ if __name__ == "__main__":
             ring_attention_tpu(None, None, None)
             assert False, "Should have raised ImportError"
         except ImportError as e:
-            print(f"Correctly raised: {e}")
+            print(f"Correctly raised ImportError: {e}")
     print("PASSED")
