@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-__all__ = ["FlashAttentionCPU"]
+__all__ = ["FlashAttentionCPU", "flash_attention_cpu"]
 
 logger = logging.getLogger(__name__)
 
@@ -251,3 +251,76 @@ class FlashAttentionCPU(nn.Module):
 
         attn = torch.softmax(attn, dim=-1)
         return torch.matmul(attn, v)
+
+
+# ---------------------------------------------------------------------------
+# flash_attention_cpu — Phase 3 convenience function
+# ---------------------------------------------------------------------------
+
+
+def flash_attention_cpu(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    causal: bool = True,
+    chunk_size: int = 512,
+) -> torch.Tensor:
+    """Memory-efficient chunked attention for CPU.
+
+    Processes attention in chunks of ``chunk_size`` to avoid materialising
+    the full ``(seq, seq)`` attention matrix.  ``O(seq × chunk_size)`` memory
+    instead of ``O(seq²)``.
+
+    No ring communication — single device only.
+    Suitable for: development, Apple M3 Ultra inference, CPU-only environments.
+
+    NOT suitable for: training on context > 32K (too slow).
+
+    Parameters
+    ----------
+    q : Tensor
+        ``(batch, seq, heads, head_dim)`` — queries.
+    k : Tensor
+        ``(batch, seq, heads, head_dim)`` — keys.
+    v : Tensor
+        ``(batch, seq, heads, head_dim)`` — values.
+    causal : bool
+        Apply causal masking (default ``True``).
+    chunk_size : int
+        Number of query tokens per chunk (default 512).
+
+    Returns
+    -------
+    Tensor
+        ``(batch, seq, heads, head_dim)`` — attention output.
+
+    Time complexity:  O(S² × D) total
+    Space complexity: O(chunk_size × S × D) — never materialises full S×S
+    """
+    if q.ndim != 4:
+        raise ValueError(
+            f"Expected q of shape (batch, seq, heads, head_dim), got {q.shape}"
+        )
+
+    # Transpose from (B, S, H, D) to (B, H, S, D) for the FlashAttentionCPU module
+    q_t = q.transpose(1, 2).contiguous()
+    k_t = k.transpose(1, 2).contiguous()
+    v_t = v.transpose(1, 2).contiguous()
+
+    module = FlashAttentionCPU(chunk_size=chunk_size)
+    output = module.forward(q_t, k_t, v_t, causal=causal)
+
+    # Transpose back to (B, S, H, D)
+    return output.transpose(1, 2).contiguous()
+
+
+if __name__ == "__main__":
+    # Self-test: run with world_size=1 (no distributed setup needed)
+    print("Testing flash_attention_cpu...")
+    q = torch.randn(1, 64, 4, 32)
+    k = torch.randn(1, 64, 4, 32)
+    v = torch.randn(1, 64, 4, 32)
+    out = flash_attention_cpu(q, k, v, causal=True, chunk_size=16)
+    assert out.shape == (1, 64, 4, 32), f"Expected (1, 64, 4, 32), got {out.shape}"
+    assert not out.isnan().any(), "Output contains NaN"
+    print("PASSED")

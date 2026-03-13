@@ -25,6 +25,8 @@ __all__ = [
     "Link",
     "Topology",
     "TopologyDetector",
+    "TopologyInfo",
+    "detect_topology",
 ]
 
 logger = logging.getLogger(__name__)
@@ -565,3 +567,198 @@ class TopologyDetector:
             )
             warnings.warn(msg, stacklevel=3)
             logger.warning(msg)
+
+
+# ---------------------------------------------------------------------------
+# TopologyInfo — lightweight topology summary per the Phase 3 spec
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TopologyInfo:
+    """Detected hardware topology summary for ring attention.
+
+    Attributes
+    ----------
+    backend : str
+        Communication backend: ``"nccl"``, ``"xla_ici"``, ``"gloo"``, ``"mpi"``.
+    interconnect : str
+        Interconnect type: ``"nvlink"``, ``"pcie_gen5"``, ``"pcie_gen4"``,
+        ``"ici_2d_torus"``, ``"ici_3d_torus"``, ``"infinity_fabric"``.
+    ring_bandwidth_gbps : float
+        Effective ring bandwidth in GB/s for ring attention.
+    world_size : int
+        Total number of participating devices.
+    local_rank : int
+        Rank of this process within the local node.
+    global_rank : int
+        Global rank of this process.
+    num_nodes : int
+        Number of distinct nodes.
+    gpus_per_node : int
+        Number of GPUs (or accelerators) per node.
+    s_min_tokens : int
+        Minimum ring attention chunk size for this hardware.
+
+    Time complexity:  O(1) for construction.
+    Space complexity: O(1).
+    """
+
+    backend: str
+    interconnect: str
+    ring_bandwidth_gbps: float
+    world_size: int
+    local_rank: int
+    global_rank: int
+    num_nodes: int
+    gpus_per_node: int
+    s_min_tokens: int
+
+    def __repr__(self) -> str:
+        return (
+            f"TopologyInfo(\n"
+            f"  backend={self.backend!r},\n"
+            f"  interconnect={self.interconnect!r},\n"
+            f"  ring_bandwidth_gbps={self.ring_bandwidth_gbps:.1f},\n"
+            f"  world_size={self.world_size},\n"
+            f"  local_rank={self.local_rank},\n"
+            f"  global_rank={self.global_rank},\n"
+            f"  num_nodes={self.num_nodes},\n"
+            f"  gpus_per_node={self.gpus_per_node},\n"
+            f"  s_min_tokens={self.s_min_tokens}\n"
+            f")"
+        )
+
+
+def detect_topology() -> TopologyInfo:
+    """Auto-detect hardware topology from ``torch.distributed`` and device info.
+
+    Detects the communication backend, interconnect type, ring bandwidth,
+    and computes the minimum ring attention chunk size ``s_min_tokens``
+    using the formula::
+
+        s_min = ceil((compute_tflops × 1000) / ring_bandwidth_gbps)
+
+    Known hardware configurations with pre-computed values:
+
+    * H100 NVLink 4.0: ``ring_bandwidth_gbps=900``, ``s_min=1099``
+    * TPU v5e ICI: ``ring_bandwidth_gbps=400``, ``s_min=493``
+    * PCIe Gen4: ``ring_bandwidth_gbps=64``, ``s_min=15454``
+    * PCIe Gen5: ``ring_bandwidth_gbps=128``, ``s_min=7726``
+
+    Emits a warning when PCIe Gen4 is detected with large context lengths.
+
+    Returns
+    -------
+    TopologyInfo
+        Populated topology information.
+
+    Time complexity:  O(D²) where D = number of devices.
+    Space complexity: O(1) for the returned dataclass.
+    """
+    import math
+    import os
+
+    # Defaults for single-device / non-distributed
+    world_size = 1
+    global_rank = 0
+    local_rank = 0
+    backend = "gloo"
+
+    # Check torch.distributed
+    dist_available = False
+    try:
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            dist_available = True
+            world_size = dist.get_world_size()
+            global_rank = dist.get_rank()
+            backend = dist.get_backend()
+    except Exception:
+        pass
+
+    # Local rank from environment variable (standard convention)
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
+    # Detect hardware via the existing TopologyDetector
+    detector = TopologyDetector()
+    topo = detector.detect()
+
+    # Determine interconnect string and ring bandwidth
+    interconnect: str
+    ring_bw: float
+    compute_tflops: float
+
+    if topo.devices:
+        compute_tflops = sum(d.compute_tflops for d in topo.devices) / len(topo.devices)
+    else:
+        compute_tflops = 2.0  # CPU fallback
+
+    link_type = topo.interconnect_type
+    if link_type == LinkType.NVLINK:
+        interconnect = "nvlink"
+        ring_bw = 900.0  # H100 NVLink 4.0 bidirectional
+        if backend != "nccl" and dist_available:
+            backend = "nccl"
+    elif link_type == LinkType.ICI:
+        interconnect = "ici_2d_torus"
+        ring_bw = 400.0  # TPU v5e ICI
+        backend = "xla_ici"
+    elif link_type == LinkType.PCIE:
+        # Distinguish Gen4 vs Gen5
+        if topo.ring_bandwidth_gb_s >= 50.0:
+            interconnect = "pcie_gen5"
+            ring_bw = 128.0
+        else:
+            interconnect = "pcie_gen4"
+            ring_bw = 64.0
+    else:
+        interconnect = "pcie_gen4"
+        ring_bw = 64.0
+
+    # Compute s_min
+    if ring_bw > 0:
+        s_min = int(math.ceil((compute_tflops * 1e3) / ring_bw))
+    else:
+        s_min = 0
+
+    # Determine gpus_per_node
+    gpus_per_node = 1
+    if torch.cuda.is_available():
+        gpus_per_node = torch.cuda.device_count()
+    elif topo.devices:
+        gpus_per_node = len(topo.devices)
+
+    num_nodes = max(1, world_size // max(gpus_per_node, 1))
+
+    # PCIe Gen4 warning for large contexts
+    if interconnect == "pcie_gen4":
+        logger.warning(
+            "WARNING: PCIe Gen4 ring attention requires S_min=%d tokens. "
+            "For 1M context with 8 devices this requires 125K tokens per "
+            "device — memory pressure will be extreme. Consider NVLink or "
+            "ICI hardware.",
+            s_min,
+        )
+
+    return TopologyInfo(
+        backend=backend,
+        interconnect=interconnect,
+        ring_bandwidth_gbps=ring_bw,
+        world_size=world_size,
+        local_rank=local_rank,
+        global_rank=global_rank,
+        num_nodes=num_nodes,
+        gpus_per_node=gpus_per_node,
+        s_min_tokens=s_min,
+    )
+
+
+if __name__ == "__main__":
+    # Self-test: run with world_size=1 (no distributed setup needed)
+    print("Testing topology detection...")
+    info = detect_topology()
+    print(info)
+    assert info.world_size >= 1
+    assert info.s_min_tokens >= 0
+    print("PASSED")

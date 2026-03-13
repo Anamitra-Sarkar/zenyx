@@ -162,13 +162,18 @@ class VocabParallelCrossEntropy(torch.autograd.Function):
 def vocab_parallel_cross_entropy(
     logits_parallel: torch.Tensor,
     targets: torch.Tensor,
-    vocab_start_index: int,
-    vocab_end_index: int,
+    vocab_start_index: Optional[int] = None,
+    vocab_end_index: Optional[int] = None,
     process_group: Optional[dist.ProcessGroup] = None,
 ) -> torch.Tensor:
     """Compute vocabulary-parallel cross-entropy loss.
 
     Wrapper around :class:`VocabParallelCrossEntropy` autograd function.
+
+    When ``vocab_start_index`` and ``vocab_end_index`` are ``None``, they
+    are automatically inferred from the local logit shape and the rank
+    within ``process_group``.  For single-device (non-distributed) training,
+    defaults to ``[0, V_local)``.
 
     Parameters
     ----------
@@ -176,16 +181,18 @@ def vocab_parallel_cross_entropy(
         Local shard of logits for vocabulary range ``[vocab_start, vocab_end)``.
     targets : Tensor[...]
         Ground-truth token ids (global vocabulary indices).
-    vocab_start_index : int
-        Inclusive start of this rank's vocabulary slice.
-    vocab_end_index : int
-        Exclusive end of this rank's vocabulary slice.
+    vocab_start_index : int | None
+        Inclusive start of this rank's vocabulary slice.  Auto-inferred if
+        ``None``.
+    vocab_end_index : int | None
+        Exclusive end of this rank's vocabulary slice.  Auto-inferred if
+        ``None``.
     process_group : ProcessGroup | None
-        Torch distributed process group.
+        Torch distributed process group.  ``None`` → single-device.
 
     Returns
     -------
-    Tensor[...]
+    Tensor
         Per-token cross-entropy loss.
 
     Complexity
@@ -193,6 +200,35 @@ def vocab_parallel_cross_entropy(
     Time : O(V_local × B) + 2 AllReduce(B)
     Space: O(V_local × B)
     """
+    V_local = logits_parallel.size(-1)
+
+    if vocab_start_index is None or vocab_end_index is None:
+        # Auto-infer from rank
+        if dist.is_available() and dist.is_initialized() and process_group is not None:
+            rank = dist.get_rank(group=process_group)
+        elif dist.is_available() and dist.is_initialized():
+            rank = dist.get_rank()
+        else:
+            rank = 0
+        vocab_start_index = rank * V_local
+        vocab_end_index = (rank + 1) * V_local
+
     return VocabParallelCrossEntropy.apply(
         logits_parallel, targets, vocab_start_index, vocab_end_index, process_group
     )
+
+
+if __name__ == "__main__":
+    # Self-test: run with world_size=1 (no distributed setup needed)
+    print("Testing VocabParallelCrossEntropy...")
+    # Single-device test with small vocab
+    local_logits = torch.randn(4, 100, dtype=torch.float32, requires_grad=True)
+    targets = torch.randint(0, 100, (4,))
+    loss = vocab_parallel_cross_entropy(local_logits, targets, process_group=None)
+    assert loss.shape == (4,), f"Expected shape (4,), got {loss.shape}"
+    assert not loss.isnan().any(), "Loss contains NaN"
+    # Test backward
+    loss.sum().backward()
+    assert local_logits.grad is not None, "No gradient computed"
+    print(f"Loss: {loss}")
+    print("PASSED")
