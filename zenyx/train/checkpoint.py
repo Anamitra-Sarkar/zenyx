@@ -16,6 +16,12 @@ Fix notes
   dict captured *before* the background thread starts, not from inside
   _write_shards. This prevents a second concurrent save() from reading a
   partially-committed checksums map.
+* Duplicate numpy import: load() previously imported numpy twice (once at
+  the top of the method, once inside the bfloat16 branch). Consolidated
+  to a single import at the start of the method body.
+* Zero-copy bfloat16 load: arr_u16.tobytes() created an unnecessary
+  intermediate bytes copy. Fixed to pass raw_bytes directly to
+  torch.frombuffer(raw_bytes, dtype=torch.uint16).view(torch.bfloat16).
 """
 
 from __future__ import annotations
@@ -284,6 +290,8 @@ class AsyncCheckpointer:
                 logger.warning("Shard file missing: %s — skipping %s", shard_path, meta.name)
                 continue
 
+            # Single numpy import per tensor load — no duplicate import inside
+            # the bfloat16 branch.
             import numpy as np
 
             raw_bytes = shard_path.read_bytes()
@@ -291,13 +299,13 @@ class AsyncCheckpointer:
                 dtype_torch = getattr(torch, meta.dtype.replace("torch.", ""), torch.float32)
 
                 if dtype_torch == torch.bfloat16:
-                    # bfloat16 was stored as uint16 raw bytes.
-                    # Reconstruct via torch.frombuffer with uint16, then view-cast
-                    # back to bfloat16. This preserves the exact bit pattern.
-                    import numpy as np
-                    arr_u16 = np.frombuffer(raw_bytes, dtype=np.uint16)
+                    # bfloat16 was stored as uint16 raw bytes (view-cast on
+                    # save). Reconstruct zero-copy: pass raw_bytes directly
+                    # to torch.frombuffer as uint16, then view-cast to
+                    # bfloat16. The previous code called arr_u16.tobytes()
+                    # which created an unnecessary intermediate bytes copy.
                     t = torch.frombuffer(
-                        arr_u16.tobytes(), dtype=torch.uint16
+                        raw_bytes, dtype=torch.uint16
                     ).view(torch.bfloat16)
                     result[meta.name] = t.reshape(meta.shape).clone()
                 else:
