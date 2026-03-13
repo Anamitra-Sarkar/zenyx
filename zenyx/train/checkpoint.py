@@ -16,12 +16,13 @@ Fix notes
   dict captured *before* the background thread starts, not from inside
   _write_shards. This prevents a second concurrent save() from reading a
   partially-committed checksums map.
-* Duplicate numpy import: load() previously imported numpy twice (once at
-  the top of the method, once inside the bfloat16 branch). Consolidated
-  to a single import at the start of the method body.
-* Zero-copy bfloat16 load: arr_u16.tobytes() created an unnecessary
-  intermediate bytes copy. Fixed to pass raw_bytes directly to
-  torch.frombuffer(raw_bytes, dtype=torch.uint16).view(torch.bfloat16).
+* load() duplicate import: numpy was imported twice inside the method —
+  once at the method scope and again inside the bfloat16 branch.  The
+  redundant inner import has been removed.
+* load() bfloat16 zero-copy: the previous code called arr_u16.tobytes()
+  which created a second copy of the data in a new bytes object before
+  passing it to torch.frombuffer.  The fix passes raw_bytes directly to
+  torch.frombuffer so no intermediate copy is made.
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
+import numpy as np
 import torch
 
 __all__ = [
@@ -63,23 +65,7 @@ _BFLOAT16_MARKER: str = "torch.bfloat16"
 
 @dataclass
 class _ShardMeta:
-    """Per-tensor metadata stored in the checkpoint manifest.
-
-    Attributes
-    ----------
-    name : str
-        Fully-qualified parameter name.
-    shape : List[int]
-        Tensor dimensions.
-    dtype : str
-        String representation of the torch dtype.
-    filename : str
-        Shard filename on disk.
-    byte_size : int
-        Raw byte count.
-    checksum : str
-        MD5 hex digest for integrity and incremental diffing.
-    """
+    """Per-tensor metadata stored in the checkpoint manifest."""
 
     name: str
     shape: List[int]
@@ -89,12 +75,6 @@ class _ShardMeta:
     checksum: str
 
     def to_dict(self) -> Dict[str, Any]:
-        """Serialise to JSON-compatible dict.
-
-        Complexity
-        ----------
-        Time *O(1)*.
-        """
         return {
             "name": self.name,
             "shape": self.shape,
@@ -106,12 +86,6 @@ class _ShardMeta:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> _ShardMeta:
-        """Deserialise from dict.
-
-        Complexity
-        ----------
-        Time *O(1)*.
-        """
         return cls(**d)
 
 
@@ -154,7 +128,6 @@ class AsyncCheckpointer:
             thread_name_prefix="zenyx-ckpt-io",
         )
         self._lock = threading.Lock()
-        # Checksums from last successful save (for incremental mode).
         self._prev_checksums: Dict[str, str] = {}
         self._pending_futures: List[Future[None]] = []
 
@@ -182,14 +155,7 @@ class AsyncCheckpointer:
         -------
         concurrent.futures.Future[None]
             Resolves when the I/O completes.
-
-        Complexity
-        ----------
-        Caller: *O(M)* snapshot (CPU tensor copies), then returns immediately.
-        Background thread: *O(M_changed)* disk I/O.
         """
-        # Snapshot tensors to CPU immediately (fast, pinned-memory copy) so
-        # the GPU state can evolve while I/O proceeds.
         snapshot: Dict[str, bytes] = {}
         checksums: Dict[str, str] = {}
         meta_entries: List[_ShardMeta] = []
@@ -197,10 +163,6 @@ class AsyncCheckpointer:
         for name, tensor in state_dict.items():
             cpu_tensor = tensor.detach().cpu()
 
-            # bfloat16 fix: numpy has no bfloat16 dtype.
-            # Store as raw uint16 bytes via view-cast (zero-copy reinterpret).
-            # The dtype string in metadata signals the loader to reconstruct
-            # correctly via torch.frombuffer.
             if cpu_tensor.dtype == torch.bfloat16:
                 raw = cpu_tensor.contiguous().view(torch.uint16).numpy().tobytes()
             else:
@@ -219,23 +181,17 @@ class AsyncCheckpointer:
                 _ShardMeta(
                     name=name,
                     shape=list(tensor.shape),
-                    dtype=str(tensor.dtype),  # e.g. "torch.bfloat16"
+                    dtype=str(tensor.dtype),
                     filename=filename,
                     byte_size=len(raw),
                     checksum=chk,
                 )
             )
 
-        # Race fix: capture a snapshot of checksums *before* submitting the
-        # background job. _write_shards receives this snapshot and commits it
-        # atomically under self._lock after all writes succeed. A concurrent
-        # save() call that starts before _write_shards finishes will see the
-        # pre-commit _prev_checksums and correctly re-diff against it.
         future: Future[None] = self._executor.submit(
             self._write_shards, path, snapshot, meta_entries, checksums
         )
         with self._lock:
-            # Prune completed futures.
             self._pending_futures = [f for f in self._pending_futures if not f.done()]
             self._pending_futures.append(future)
 
@@ -257,15 +213,10 @@ class AsyncCheckpointer:
         ------
         FileNotFoundError
             If the metadata file is missing.
-
-        Complexity
-        ----------
-        Time *O(M)*, space *O(M)*.
         """
         ckpt_dir = Path(path)
         meta_path = ckpt_dir / f"rank{self.rank}_{_METADATA_FILENAME}"
         if not meta_path.exists():
-            # Try global metadata.
             meta_path = ckpt_dir / _METADATA_FILENAME
         if not meta_path.exists():
             raise FileNotFoundError(
@@ -290,20 +241,19 @@ class AsyncCheckpointer:
                 logger.warning("Shard file missing: %s — skipping %s", shard_path, meta.name)
                 continue
 
-            # Single numpy import per tensor load — no duplicate import inside
-            # the bfloat16 branch.
-            import numpy as np
-
             raw_bytes = shard_path.read_bytes()
             try:
                 dtype_torch = getattr(torch, meta.dtype.replace("torch.", ""), torch.float32)
 
                 if dtype_torch == torch.bfloat16:
-                    # bfloat16 was stored as uint16 raw bytes (view-cast on
-                    # save). Reconstruct zero-copy: pass raw_bytes directly
-                    # to torch.frombuffer as uint16, then view-cast to
-                    # bfloat16. The previous code called arr_u16.tobytes()
-                    # which created an unnecessary intermediate bytes copy.
+                    # bfloat16 was stored as uint16 raw bytes.
+                    # Fix: pass raw_bytes directly to torch.frombuffer — no
+                    # intermediate numpy array or .tobytes() copy needed.
+                    # The previous code did:
+                    #   arr_u16 = np.frombuffer(raw_bytes, dtype=np.uint16)
+                    #   t = torch.frombuffer(arr_u16.tobytes(), ...)
+                    # arr_u16.tobytes() created a redundant copy; raw_bytes
+                    # already is the bytes object we need.
                     t = torch.frombuffer(
                         raw_bytes, dtype=torch.uint16
                     ).view(torch.bfloat16)
@@ -334,29 +284,14 @@ class AsyncCheckpointer:
         return result
 
     def wait(self, timeout: Optional[float] = None) -> None:
-        """Block until all pending saves complete.
-
-        Parameters
-        ----------
-        timeout : float, optional
-            Max seconds to wait (``None`` = forever).
-
-        Complexity
-        ----------
-        Time bounded by I/O latency.
-        """
+        """Block until all pending saves complete."""
         with self._lock:
             futures = list(self._pending_futures)
         for fut in futures:
             fut.result(timeout=timeout)
 
     def shutdown(self) -> None:
-        """Wait for pending I/O and shut down the thread pool.
-
-        Complexity
-        ----------
-        Time bounded by pending I/O.
-        """
+        """Wait for pending I/O and shut down the thread pool."""
         self.wait()
         self._executor.shutdown(wait=True)
 
@@ -369,16 +304,7 @@ class AsyncCheckpointer:
         meta_entries: List[_ShardMeta],
         checksums: Dict[str, str],
     ) -> None:
-        """Background: write shard files and metadata JSON.
-
-        After all writes succeed, atomically commit the checksums snapshot
-        to _prev_checksums under self._lock. This prevents a concurrent
-        save() call from seeing a partially-committed checksums map.
-
-        Complexity
-        ----------
-        Time *O(M_changed)*, space *O(1)* streaming writes.
-        """
+        """Background: write shard files and metadata JSON."""
         ckpt_dir = Path(path)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
@@ -387,7 +313,6 @@ class AsyncCheckpointer:
             shard_path.write_bytes(raw_bytes)
             logger.debug("Wrote shard %s (%d bytes)", shard_path, len(raw_bytes))
 
-        # Write metadata.
         meta_dict = {
             "rank": self.rank,
             "world_size": self.world_size,
@@ -398,9 +323,6 @@ class AsyncCheckpointer:
         with open(meta_path, "w") as f:
             json.dump(meta_dict, f, indent=2)
 
-        # Atomically commit checksums only after all writes succeed.
-        # Holding self._lock here ensures a concurrent save() that reads
-        # _prev_checksums always sees a fully-committed snapshot.
         with self._lock:
             self._prev_checksums.update(checksums)
 
@@ -410,8 +332,6 @@ class AsyncCheckpointer:
             len(snapshot),
             self.rank,
         )
-
-    # -- dunder -------------------------------------------------------------
 
     def __repr__(self) -> str:
         with self._lock:
