@@ -32,3 +32,8 @@ def test_no_weights_only_false_in_trainer() -> None:
         "trainer.py contains weights_only=False — this is a security risk "
         "for PyTorch >= 2.5. Use weights_only=True."
     )
+    assert "weights_only=True" in content, (
+        "trainer.py must contain weights_only=True in its "
+        "torch.load call — a bare torch.load() defaults to "
+        "weights_only=False in PyTorch >= 2.5 and is a security risk."
+    )

@@ -381,7 +381,14 @@ def _legacy_train(
         logger.info("Feasibility check SOFT-FAIL — throttle mode active (no crash).")
 
     # ---- Step 5: Wrap model with FP8 checkpointing ----
-    model = wrap(model, fp8_every_n=fp8_every_n)
+    # Call fp8_checkpoint directly to avoid double DeprecationWarning
+    # (wrap() also emits DeprecationWarning; _legacy_train already warned above).
+    from zenyx.train.mixed_prec import fp8_checkpoint as _fp8_ckpt
+    model = _fp8_ckpt(
+        model,
+        every_n=fp8_every_n,
+        force_simulated=False,
+    )
     model = model.to(device)
 
     # ---- Step 6: Optimiser ----
