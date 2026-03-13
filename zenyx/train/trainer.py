@@ -333,7 +333,7 @@ class Trainer:
                 if hasattr(self, "_topo_info") else 1,
                 **kv_tier_config if isinstance(kv_tier_config, dict) else {},
             )
-            logger.info("Phase 7: BéládyKVCacheManager initialized")
+            logger.info("Phase 7: BeladyKVCacheManager initialized")
 
         # --- Step 18: Phase 8 — FP8 KV Quantization ---
         if fp8_kv:
@@ -360,9 +360,17 @@ class Trainer:
         # --- Step 20: Phase 10 — Sparse Ring Attention ---
         if sparse_attn:
             from zenyx.ops.attention.sparse_ring_attn import SparseRingAttentionKernel
+            # Determine num_layers from model architecture
+            num_layers = 2  # default for tiny models
+            for attr_name in ("layers", "blocks", "encoder", "decoder"):
+                layers_attr = getattr(model, attr_name, None)
+                if layers_attr is not None and hasattr(layers_attr, "__len__"):
+                    num_layers = len(layers_attr)
+                    break
+
             self._sparse_kernel = SparseRingAttentionKernel(
                 skip_mode=sparse_skip_mode,
-                num_layers=2,  # Use model layer count in production
+                num_layers=num_layers,
                 seq_len=context_len,
                 window_size=min(131_072, context_len),
                 ring_degree=max(1, (self._topo_info.world_size

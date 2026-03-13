@@ -254,11 +254,11 @@ def dequantize_kv(
         k_bf16 = k_fp8 * k_scales.unsqueeze(-2)
         v_bf16 = v_fp8 * v_scales.unsqueeze(-1)
     elif strategy == "per_head":
-        k_bf16 = k_fp8 * k_scales.unsqueeze(-1).unsqueeze(-1) / FP8_E4M3_MAX
-        # Undo: k_fp8 = k / k_abs_max * FP8_E4M3_MAX, so k = k_fp8 * k_abs_max / FP8_E4M3_MAX
-        # k_scales = k_abs_max / FP8_E4M3_MAX, so k_abs_max = k_scales * FP8_E4M3_MAX
-        k_bf16 = k_fp8 * (k_scales * FP8_E4M3_MAX).unsqueeze(-1).unsqueeze(-1) / FP8_E4M3_MAX
-        v_bf16 = v_fp8 * (v_scales * FP8_E4M3_MAX).unsqueeze(-1).unsqueeze(-1) / FP8_E4M3_MAX
+        # Per-head: k_scales = k_abs_max / FP8_E4M3_MAX (scalar per head)
+        # k_fp8 = k / k_abs_max * FP8_E4M3_MAX
+        # Dequantize: k = k_fp8 * k_scales (since k_scales = k_abs_max / FP8_E4M3_MAX)
+        k_bf16 = k_fp8 * k_scales.unsqueeze(-1).unsqueeze(-1)
+        v_bf16 = v_fp8 * v_scales.unsqueeze(-1).unsqueeze(-1)
     else:
         raise ValueError(f"Unknown strategy: {strategy!r}")
 

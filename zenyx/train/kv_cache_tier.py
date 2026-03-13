@@ -471,8 +471,6 @@ class BeladyKVCacheManager:
 
         Eviction key = next access time from the combined fwd+bwd timeline.
         """
-        if pass_type_hint := None:  # noqa: F841 — placeholder
-            pass
         current_time = layer_idx * self.ring_degree + ring_step
         self._evict_from_t0(current_time)
 
