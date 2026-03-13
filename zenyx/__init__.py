@@ -6,6 +6,7 @@ Never OOM. No config. GPU, TPU, CPU, AMD, Apple Silicon.
 Exports
 -------
 - :func:`train` — single entry-point for training.
+- :class:`Trainer` — full-stack trainer class.
 - :func:`wrap` — wraps a model with Zenyx memory management.
 - :mod:`bench` — benchmarking utilities (memory budget, vs DeepSpeed).
 
@@ -14,7 +15,7 @@ Usage::
     import zenyx
 
     # Train a model — everything auto-configured
-    zenyx.train(model, dataloader)
+    trainer = zenyx.train(model, dataloader, context_len=131072)
 
     # Or wrap for manual control
     model = zenyx.wrap(model)
@@ -22,18 +23,43 @@ Usage::
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.4.0"
 __all__ = [
     "__version__",
+    "Trainer",
     "train",
     "wrap",
     "bench",
+    "auto_init_distributed",
+    "get_rank",
+    "get_world_size",
+    "is_main_process",
+    "barrier",
 ]
 
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Optional
 
 logger = logging.getLogger("zenyx")
+
+# ── Phase 4 imports ──────────────────────────────────────────────────────
+
+from zenyx.train.trainer import Trainer
+from zenyx.train.trainer import train as _trainer_train
+from zenyx.train.distributed_setup import (
+    auto_init_distributed,
+    get_rank,
+    get_world_size,
+    is_main_process,
+    barrier,
+)
+
+# Convenience: auto-init distributed on import if env vars suggest it
+# but ONLY if ZENYX_AUTO_INIT_DISTRIBUTED=1 is set
+# (don't force init on every import — that breaks testing)
+if os.environ.get("ZENYX_AUTO_INIT_DISTRIBUTED", "0") == "1":
+    auto_init_distributed()
 
 # ── Lazy hardware detection ──────────────────────────────────────────────
 
@@ -66,16 +92,15 @@ def hardware(self: Any) -> Any:
 def train(
     model: Any,
     dataloader: Any,
-    hardware: Any = None,
-    context_len: Optional[int] = None,
-    vocab_size: Optional[int] = None,
-) -> None:
+    **kwargs: Any,
+) -> Trainer:
     """Train a model — Zenyx handles everything else.
 
     This is the single entry-point.  Zenyx will auto-detect hardware,
     plan parallelism, manage memory across three tiers, and never OOM.
 
-    Time: O(steps × model_size).  Space: managed by TierAllocator.
+    Creates a Trainer with the given model and dataloader, starts training,
+    and returns the Trainer for inspection.
 
     Parameters
     ----------
@@ -83,111 +108,20 @@ def train(
         A ``torch.nn.Module`` (or compatible).
     dataloader : Any
         An iterable of training batches.
-    hardware : Any, optional
-        A :class:`~zenyx.core.hal.base.HardwareInfo` instance.
-        Auto-detected if ``None``.
-    context_len : int, optional
-        Maximum sequence length.  Inferred from first batch if ``None``.
-    vocab_size : int, optional
-        Vocabulary size.  Inferred from model config if ``None``.
+    **kwargs
+        Additional keyword arguments passed to :class:`Trainer`.
+
+    Returns
+    -------
+    Trainer
+        The trainer instance after training completes.
+
+    Example::
+
+        trainer = zenyx.train(model, dataloader, context_len=131072)
+        state = trainer.get_state()
     """
-    # Step 1: hardware detection
-    if hardware is None:
-        hardware = _auto_detect_hardware()
-    logger.info("Zenyx v%s — training on %s", __version__, hardware)
-
-    # Step 2: detect topology
-    from zenyx.ops.comm.topology import TopologyDetector
-
-    topology = TopologyDetector.detect()
-    logger.debug("Topology: %s", topology)
-
-    # Step 3: set up profiler
-    from zenyx.core.agent.profiler import AsyncProfiler
-
-    profiler = AsyncProfiler(enabled=True)
-
-    # Step 4: plan parallelism
-    from zenyx.core.agent.planner import ParallelismPlanner
-
-    planner = ParallelismPlanner(hardware, topology)
-
-    # Estimate model params
-    model_params = _count_params(model)
-    _context_len = context_len or 2048
-    _vocab_size = vocab_size or _infer_vocab_size(model)
-    batch_size = _infer_batch_size(dataloader)
-
-    plan = planner.plan(model_params, _vocab_size, _context_len, batch_size)
-    logger.info("Plan: %s", plan)
-
-    # Step 5: print memory budget
-    from zenyx.bench.memory_budget import memory_budget
-
-    hw_name = _map_hw_to_preset(hardware)
-    if hw_name:
-        report = memory_budget(model_params, _vocab_size, _context_len, hw_name)
-        logger.info("\n%s", report)
-
-    # Step 6: set up training controller
-    from zenyx.core.agent.controller import TrainingController
-
-    controller = TrainingController(
-        planner=planner,
-        profiler=profiler,
-        model_params=model_params,
-        vocab_size=_vocab_size,
-        batch_size=batch_size,
-    )
-
-    # Step 7: training loop
-    import itertools
-
-    step = 0
-    for batch in dataloader:
-        handle = profiler.start_op("train_step")
-
-        # Forward
-        if isinstance(batch, (tuple, list)):
-            inputs = batch[0]
-        else:
-            inputs = batch
-
-        try:
-            import torch
-
-            if torch.cuda.is_available() and hasattr(inputs, "to"):
-                inputs = inputs.to("cuda")
-        except ImportError:
-            pass
-
-        fwd_handle = profiler.start_op("forward")
-        output = model(inputs)
-        profiler.end_op(fwd_handle)
-
-        # Loss + backward
-        loss_val = 0.0
-        if hasattr(output, "mean"):
-            loss = output.mean()
-            loss_val = loss.item() if hasattr(loss, "item") else float(loss)
-            bwd_handle = profiler.start_op("backward")
-            if hasattr(loss, "backward"):
-                loss.backward()
-            profiler.end_op(bwd_handle)
-
-        profiler.end_op(handle)
-
-        # Controller step — may trigger replan
-        new_plan = controller.step(step, loss_val, _context_len)
-        if new_plan is not None:
-            plan = new_plan
-
-        step += 1
-
-    # Cleanup
-    profiler.shutdown()
-    stats = controller.get_training_stats()
-    logger.info("Training complete: %s", stats)
+    return _trainer_train(model, dataloader, **kwargs)
 
 
 def wrap(model: Any) -> Any:
