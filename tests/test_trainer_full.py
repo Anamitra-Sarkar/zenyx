@@ -229,3 +229,162 @@ class TestDisputeResolution:
             "DISPUTE_8B_RESOLVED: per_channel_nonzero=%.2f%%, per_head_nonzero=%.2f%%",
             ch_nonzero_frac * 100, hd_nonzero_frac * 100,
         )
+
+
+# ---------------------------------------------------------------------------
+# ISSUE 2 — Tests for Steps 13, 17, 19, 20
+# ---------------------------------------------------------------------------
+
+
+class TestTrainerStep13CheckpointResume:
+    """Verify checkpoint save/resume restores state correctly."""
+
+    def test_checkpoint_resume(self, tmp_path) -> None:
+        """Create trainer, train 2 steps, save checkpoint, resume from it."""
+        model = TinyModel()
+        # Need at least 2 batches so the loop can run 2 steps
+        data = [
+            (torch.randint(0, 256, (2, 64)), torch.randint(0, 256, (2, 64))),
+            (torch.randint(0, 256, (2, 64)), torch.randint(0, 256, (2, 64))),
+        ]
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            from zenyx.train.trainer import Trainer
+
+            ckpt_dir = str(tmp_path / "ckpts")
+            trainer1 = Trainer(
+                model=model,
+                dataloader=data,
+                context_len=64,
+                total_steps=2,
+                checkpoint_dir=ckpt_dir,
+                checkpoint_every=1,
+                gradient_accumulation_steps=1,
+            )
+            trainer1.train()
+
+        assert trainer1._step == 2, f"Expected step=2 after training, got {trainer1._step}"
+
+        # Find the checkpoint file
+        import os
+        ckpt_files = [f for f in os.listdir(ckpt_dir) if f.endswith(".pt")]
+        assert len(ckpt_files) > 0, "No checkpoint file was created"
+        # Use the latest one (step_2.pt)
+        ckpt_path = os.path.join(ckpt_dir, sorted(ckpt_files)[-1])
+
+        # Create a second trainer and resume
+        model2 = TinyModel()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            trainer2 = Trainer(
+                model=model2,
+                dataloader=data,
+                context_len=64,
+                total_steps=4,
+                checkpoint_dir=ckpt_dir,
+                resume_from=ckpt_path,
+                gradient_accumulation_steps=1,
+            )
+
+        assert trainer2._step == 2, f"Expected step=2 after resume, got {trainer2._step}"
+
+        # Verify model weights match
+        for (n1, p1), (n2, p2) in zip(
+            trainer1._model.state_dict().items(),
+            trainer2._model.state_dict().items(),
+        ):
+            assert n1 == n2
+            assert torch.allclose(p1, p2, atol=1e-6), f"Weight mismatch for {n1}"
+
+        # Verify scheduler step count matches
+        assert trainer2._scheduler.current_step == trainer1._scheduler.current_step
+
+
+class TestTrainerStep17KvTierConfig:
+    """Verify Phase 7 KV Cache Manager is instantiated from config."""
+
+    def test_kv_tier_config_creates_manager(self) -> None:
+        from zenyx.train.kv_cache_tier import BeladyKVCacheManager
+
+        model = TinyModel()
+        data = [(torch.randint(0, 256, (2, 64)), torch.randint(0, 256, (2, 64)))]
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            from zenyx.train.trainer import Trainer
+
+            trainer = Trainer(
+                model=model,
+                dataloader=data,
+                context_len=64,
+                total_steps=1,
+                kv_tier_config={
+                    "world_size": 1,
+                    "num_layers": 4,
+                    "ring_degree": 1,
+                    "t0_budget_bytes": 1024 * 1024,
+                },
+            )
+
+        assert trainer._kv_cache_manager is not None
+        assert isinstance(trainer._kv_cache_manager, BeladyKVCacheManager)
+        assert trainer._kv_cache_manager.world_size == 1
+
+
+class TestTrainerStep19CurriculumConfig:
+    """Verify Phase 9 Ring Curriculum Manager is instantiated from config."""
+
+    def test_curriculum_config_creates_manager(self) -> None:
+        from zenyx.train.ring_curriculum import RingCurriculumManager
+
+        model = TinyModel()
+        data = [(torch.randint(0, 256, (2, 64)), torch.randint(0, 256, (2, 64)))]
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            from zenyx.train.trainer import Trainer
+
+            trainer = Trainer(
+                model=model,
+                dataloader=data,
+                context_len=64,
+                total_steps=1,
+                curriculum_config={
+                    "max_seq_len": 8192,
+                    "world_size": 1,
+                },
+            )
+
+        assert trainer._curriculum_manager is not None
+        assert isinstance(trainer._curriculum_manager, RingCurriculumManager)
+        assert trainer._curriculum_manager.max_seq_len == 8192
+
+
+class TestTrainerStep20SparseAttn:
+    """Verify Phase 10 Sparse Ring Attention Kernel is instantiated."""
+
+    def test_sparse_attn_creates_kernel(self) -> None:
+        from zenyx.ops.attention.sparse_ring_attn import SparseRingAttentionKernel
+
+        # Need enough layers to satisfy the depth assertion:
+        # num_layers >= ceil(seq_len / window_size) = ceil(64 / 64) = 1
+        model = TinyModel()
+        data = [(torch.randint(0, 256, (2, 64)), torch.randint(0, 256, (2, 64)))]
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            from zenyx.train.trainer import Trainer
+
+            trainer = Trainer(
+                model=model,
+                dataloader=data,
+                context_len=64,
+                total_steps=1,
+                sparse_attn=True,
+                sparse_skip_mode="production",
+            )
+
+        assert trainer._sparse_kernel is not None
+        assert isinstance(trainer._sparse_kernel, SparseRingAttentionKernel)
+        assert trainer._sparse_kernel.skip_mode == "production"

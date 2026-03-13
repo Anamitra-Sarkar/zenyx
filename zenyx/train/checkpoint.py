@@ -235,10 +235,19 @@ class AsyncCheckpointer:
             # Try global metadata.
             meta_path = ckpt_dir / _METADATA_FILENAME
         if not meta_path.exists():
-            raise FileNotFoundError(f"Checkpoint metadata not found at {meta_path}")
+            raise FileNotFoundError(
+                f"Checkpoint metadata not found at {ckpt_dir}. "
+                f"Expected file: rank{self.rank}_{_METADATA_FILENAME} "
+                f"or {_METADATA_FILENAME}"
+            )
 
-        with open(meta_path, "r") as f:
-            raw_meta = json.load(f)
+        try:
+            with open(meta_path, "r") as f:
+                raw_meta = json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            raise RuntimeError(
+                f"Checkpoint at {meta_path} is corrupted or unreadable: {e}"
+            ) from e
 
         result: Dict[str, torch.Tensor] = {}
         for entry_dict in raw_meta.get("shards", []):
@@ -251,17 +260,23 @@ class AsyncCheckpointer:
             import numpy as np
 
             raw_bytes = shard_path.read_bytes()
-            dtype_torch = getattr(torch, meta.dtype.replace("torch.", ""), torch.float32)
-            np_dtype = {
-                torch.float32: np.float32,
-                torch.float16: np.float16,
-                torch.bfloat16: np.float32,  # bfloat16 numpy compat
-                torch.int64: np.int64,
-                torch.int32: np.int32,
-            }.get(dtype_torch, np.float32)
+            try:
+                dtype_torch = getattr(torch, meta.dtype.replace("torch.", ""), torch.float32)
+                np_dtype = {
+                    torch.float32: np.float32,
+                    torch.float16: np.float16,
+                    torch.bfloat16: np.float32,  # bfloat16 numpy compat
+                    torch.int64: np.int64,
+                    torch.int32: np.int32,
+                }.get(dtype_torch, np.float32)
 
-            arr = np.frombuffer(raw_bytes, dtype=np_dtype).reshape(meta.shape)
-            result[meta.name] = torch.from_numpy(arr.copy()).to(dtype_torch)
+                arr = np.frombuffer(raw_bytes, dtype=np_dtype).reshape(meta.shape)
+                result[meta.name] = torch.from_numpy(arr.copy()).to(dtype_torch)
+            except (ValueError, RuntimeError) as e:
+                raise RuntimeError(
+                    f"Checkpoint shard {shard_path} for tensor '{meta.name}' "
+                    f"is corrupted or incompatible: {e}"
+                ) from e
 
         logger.info(
             "Loaded checkpoint from %s: %d tensors for rank %d.",

@@ -267,3 +267,64 @@ class TestKVTierConfig:
         cfg = KVTierConfig(t0_budget_bytes=2 * 1024**3, nvme_bandwidth_gbs=15.0)
         assert cfg.t0_budget_bytes == 2 * 1024**3
         assert cfg.nvme_bandwidth_gbs == 15.0
+
+
+# ---------------------------------------------------------------------------
+# DISPUTE 7-A — boundary verification
+# ---------------------------------------------------------------------------
+
+
+class TestDispute7ABandwidthBoundary:
+    """Verify the 8.48 GB/s boundary claim from dispute_resolutions.md row 7-A.
+
+    The corrected formula boundary is 4132/487 ≈ 8.4846 GB/s.
+    At 8.48 GB/s (the MIN_NVME_BANDWIDTH_GBS constant), both formulas FAIL,
+    meaning they agree below the boundary.  Well above both boundaries (e.g.
+    100 GB/s), both PASS.  In the narrow band between ~8.485 and ~9.27 the
+    corrected formula passes while the original still fails.
+    """
+
+    def test_both_fail_at_boundary(self) -> None:
+        """At exactly 8.48 GB/s both formulas should FAIL (agree)."""
+        bw = MIN_NVME_BANDWIDTH_GBS  # 8.48
+        pass_c, _ = validate_bandwidth_corrected(nvme_bandwidth_gbs=bw)
+        pass_o, _ = validate_bandwidth_original(nvme_bandwidth_gbs=bw)
+        assert pass_c is False, "Corrected should FAIL at 8.48 GB/s"
+        assert pass_o is False, "Original should FAIL at 8.48 GB/s"
+        assert pass_c == pass_o, "Both formulas should agree at boundary"
+
+    def test_both_fail_well_below_boundary(self) -> None:
+        """At 5.0 GB/s (well below), both should FAIL (agree)."""
+        pass_c, _ = validate_bandwidth_corrected(nvme_bandwidth_gbs=5.0)
+        pass_o, _ = validate_bandwidth_original(nvme_bandwidth_gbs=5.0)
+        assert pass_c is False
+        assert pass_o is False
+        assert pass_c == pass_o
+
+    def test_both_pass_well_above_boundary(self) -> None:
+        """At 100.0 GB/s (well above both boundaries), both should PASS."""
+        pass_c, _ = validate_bandwidth_corrected(nvme_bandwidth_gbs=100.0)
+        pass_o, _ = validate_bandwidth_original(nvme_bandwidth_gbs=100.0)
+        assert pass_c is True
+        assert pass_o is True
+        assert pass_c == pass_o
+
+    def test_boundary_value_verified(self) -> None:
+        """The exact corrected-formula boundary is payload/compute ≈ 8.4846.
+
+        Just below (8.48): both FAIL.  Just above (8.49): corrected PASS,
+        original still FAIL — the corrected formula is strictly more lenient
+        in this narrow band, confirming Source A is the safer check.
+        """
+        just_below = 8.48
+        just_above = 8.49
+
+        pc_below, _ = validate_bandwidth_corrected(nvme_bandwidth_gbs=just_below)
+        po_below, _ = validate_bandwidth_original(nvme_bandwidth_gbs=just_below)
+        assert pc_below is False and po_below is False
+
+        pc_above, _ = validate_bandwidth_corrected(nvme_bandwidth_gbs=just_above)
+        po_above, _ = validate_bandwidth_original(nvme_bandwidth_gbs=just_above)
+        # Corrected PASSES just above its boundary; original still FAILS
+        assert pc_above is True
+        assert po_above is False

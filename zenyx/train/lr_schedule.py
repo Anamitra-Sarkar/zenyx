@@ -94,6 +94,36 @@ class CosineWithWarmup:
             1.0 + math.cos(math.pi * progress)
         )
 
+    def state_dict(self) -> dict:
+        """Return serialisable scheduler state.
+
+        Saves every piece of internal state needed to resume from exactly the
+        same point.
+        """
+        return {
+            "peak_lr": self._peak_lr,
+            "warmup_steps": self._warmup_steps,
+            "total_steps": self._total_steps,
+            "min_lr": self._min_lr,
+            "step": self._step,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore scheduler state from a dict produced by :meth:`state_dict`.
+
+        After loading, the optimizer's LR is set to the value that corresponds
+        to the restored step.
+        """
+        self._peak_lr = state["peak_lr"]
+        self._warmup_steps = state["warmup_steps"]
+        self._total_steps = state["total_steps"]
+        self._min_lr = state["min_lr"]
+        self._step = state["step"]
+        # Apply the correct LR to the optimizer.
+        lr = self._compute_lr(self._step)
+        for param_group in self._optimizer.param_groups:
+            param_group["lr"] = lr
+
     def __repr__(self) -> str:
         return (
             f"CosineWithWarmup(peak_lr={self._peak_lr}, warmup={self._warmup_steps}, "
