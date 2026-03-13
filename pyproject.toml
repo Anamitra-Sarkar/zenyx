@@ -33,6 +33,10 @@ classifiers = [
 ]
 dependencies = [
     "torch>=2.5.0",
+    "triton>=3.0.0",
+    "numpy>=1.26.0",
+    "aiofiles>=23.0.0",
+    "safetensors>=0.4.0",
 ]
 
 [project.optional-dependencies]

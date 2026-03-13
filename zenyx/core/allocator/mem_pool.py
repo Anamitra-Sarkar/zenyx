@@ -22,6 +22,13 @@ from zenyx.core.hal.base import HALBase, MemBlock, MemTier, _human_bytes
 from zenyx.core.hal.detector import HardwareInfo
 from zenyx.core.allocator.feasibility import check_feasibility
 
+try:
+    import torch
+    _TORCH_AVAILABLE = True
+except ImportError:
+    torch = None  # type: ignore[assignment]
+    _TORCH_AVAILABLE = False
+
 logger = logging.getLogger("zenyx.core.allocator.mem_pool")
 
 # Block size constraints
@@ -159,6 +166,17 @@ class MemoryPool:
         else:
             logger.info("Feasibility check passed — OOM-free guarantee active")
 
+        # ---- torch.cuda.MemPool for CUDA Graph address stability ----------
+        self._cuda_pool: Optional[Any] = None
+        if _TORCH_AVAILABLE and torch.cuda.is_available():
+            try:
+                self._cuda_pool = torch.cuda.MemPool()
+                logger.info(
+                    "torch.cuda.MemPool created — CUDA Graph address stability guaranteed"
+                )
+            except (AttributeError, RuntimeError):
+                logger.debug("torch.cuda.MemPool not available in this PyTorch version")
+
     # ------------------------------------------------------------------
     # allocate
     # ------------------------------------------------------------------
@@ -218,12 +236,19 @@ class MemoryPool:
     def _do_alloc(self, size: int, tier: MemTier) -> MemBlock:
         """Perform the actual allocation via the HAL.
 
+        For T0 allocations, uses ``torch.cuda.use_mem_pool`` when available
+        to guarantee address stability for ``torch.compile`` CUDA Graph capture.
+
         Caller must hold ``self._lock``.
 
         Time complexity:  O(1).
         Space complexity: O(size).
         """
-        block = self._hal.alloc(size, tier)
+        if tier == MemTier.T0 and self._cuda_pool is not None:
+            with torch.cuda.use_mem_pool(self._cuda_pool):
+                block = self._hal.alloc(size, tier)
+        else:
+            block = self._hal.alloc(size, tier)
         state = self._tiers[tier]
         state.allocated += block.size_bytes
         state.blocks[block.block_id] = block
@@ -287,7 +312,8 @@ class MemoryPool:
         """Evict LRU blocks from *tier* until *needed* bytes are free.
 
         Caller must hold ``self._lock``.  Eviction targets the next lower
-        tier.
+        tier.  Uses a two-phase pattern: bookkeeping under the lock, then
+        blocking copies outside the lock so other threads can proceed.
 
         Args:
             tier:   Tier to evict from.
@@ -307,6 +333,10 @@ class MemoryPool:
 
         target_state = self._tiers[target_tier]
 
+        # PHASE 1: Under the lock — claim blocks, update bookkeeping,
+        # allocate destination buffers.
+        blocks_to_copy: List[tuple[MemBlock, MemBlock]] = []
+
         while state.free < needed and state.blocks:
             # Pop the oldest (LRU) block
             oldest_id, oldest_block = next(iter(state.blocks.items()))
@@ -318,32 +348,40 @@ class MemoryPool:
                 if target_tier != MemTier.T2:
                     self._evict_until(target_tier, oldest_block.size_bytes)
                 if target_state.free < oldest_block.size_bytes:
-                    return False
+                    break
 
-            # Allocate on target tier (release lock briefly for HAL call)
-            # NOTE: We stay under the lock here because _evict_until is called
-            # from allocate() which already holds the lock. The HAL alloc
-            # should be fast (pool sub-allocation).
+            # Allocate on target tier (HAL alloc is fast pool sub-allocation)
             new_block = self._hal.alloc(oldest_block.size_bytes, target_tier)
             target_state.allocated += new_block.size_bytes
             target_state.blocks[new_block.block_id] = new_block
 
-            # Copy data
-            self._hal.copy(oldest_block, new_block)
-
-            # Free old block from current tier
+            # Remove old block from current tier bookkeeping
             state.blocks.pop(oldest_id, None)
             state.allocated = max(0, state.allocated - oldest_block.size_bytes)
-            self._hal.free(oldest_block)
 
-            logger.debug(
-                "LRU evict: %s → %s (%s)",
-                tier,
-                target_tier,
-                _human_bytes(oldest_block.size_bytes),
-            )
+            blocks_to_copy.append((oldest_block, new_block))
 
-        return state.free >= needed
+        result = state.free >= needed
+
+        # PHASE 2: Outside the lock — do the actual copy and free.
+        # HAL.copy() is O(size/bandwidth) and can take milliseconds;
+        # releasing the lock prevents throughput collapse from contention.
+        if blocks_to_copy:
+            self._lock.release()
+            try:
+                for src, dst in blocks_to_copy:
+                    self._hal.copy(src, dst)
+                    self._hal.free(src)
+                    logger.debug(
+                        "LRU evict: %s → %s (%s)",
+                        tier,
+                        target_tier,
+                        _human_bytes(src.size_bytes),
+                    )
+            finally:
+                self._lock.acquire()
+
+        return result
 
     # ------------------------------------------------------------------
     # prefetch
@@ -480,6 +518,22 @@ class MemoryPool:
                 tier: (state.allocated, state.capacity)
                 for tier, state in self._tiers.items()
             }
+
+    def get_cuda_pool(self) -> Optional[Any]:
+        """Return the ``torch.cuda.MemPool`` for use as context manager
+        around ``torch.compile`` graph capture.
+
+        Must be called before any ``torch.compile(...)`` call to ensure
+        CUDA Graph address stability.
+
+        Returns:
+            The ``torch.cuda.MemPool`` instance, or ``None`` if CUDA is
+            not available or the pool was not created.
+
+        Time complexity:  O(1).
+        Space complexity: O(1).
+        """
+        return self._cuda_pool
 
     def __repr__(self) -> str:
         with self._lock:

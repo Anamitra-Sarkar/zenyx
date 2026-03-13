@@ -413,22 +413,20 @@ class ReuseHeap:
         if total_prob == 0.0:
             return float("inf")
 
-        # Scale by the fraction of probability mass that had finite
-        # distances and add an infinite contribution for the remainder.
-        if total_prob < 1.0:
-            # Some branches never touch this block — conservatively treat
-            # as very large but finite so the block is still evictable.
-            remaining = 1.0 - total_prob
-            expected_dist = expected_dist / total_prob
-            # Penalise by the chance that the block *is* needed.
-            expected_dist /= total_prob
-            # Blend: the higher the unused-branch probability, the
-            # farther out we push the effective distance.
-            expected_dist += remaining * 1e6
-        else:
-            expected_dist /= total_prob
+        # Weighted average of finite distances only, blended with a
+        # large-but-finite penalty for branches that skip this block.
+        finite_expected = expected_dist / total_prob
 
-        return expected_dist
+        if total_prob < 1.0:
+            # Blend: fraction that DO use this block contributes
+            # the finite expected distance; fraction that DON'T
+            # contributes a large penalty (1e6).
+            infinite_penalty = 1e6
+            result = total_prob * finite_expected + (1.0 - total_prob) * infinite_penalty
+        else:
+            result = finite_expected
+
+        return result
 
     # ---- internal helpers -------------------------------------------------
 
