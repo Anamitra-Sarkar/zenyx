@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from zenyx.train.checkpoint import AsyncCheckpointer
-from zenyx.train.loop import wrap
 from zenyx.train.mixed_prec import (
     FP8ActivationStorage,
     FP8CheckpointFunction,
@@ -26,6 +25,30 @@ from zenyx.train.activation_checkpoint import (
     selective_checkpoint_wrapper,
 )
 
+# Phase 7: KV Cache Tiering
+from zenyx.train.kv_cache_tier import (
+    BeladyKVCacheManager,
+    T0_KV_BUDGET_BYTES,
+    validate_bandwidth_corrected,
+    validate_bandwidth_original,
+)
+
+# Phase 8: FP8 KV Quantization
+from zenyx.train.fp8_kv import (
+    quantize_kv_fp8,
+    dequantize_kv,
+    smooth_swiglu_scale,
+    GradientMonitor,
+)
+
+# Phase 9: Dynamic Ring Curriculum
+from zenyx.train.ring_curriculum import (
+    RingCurriculumManager,
+    CurriculumConfig,
+    compute_reshard_cost_optimistic,
+    compute_reshard_cost_pessimistic,
+)
+
 __all__ = [
     # mixed_prec
     "FP8ActivationStorage",
@@ -37,8 +60,6 @@ __all__ = [
     "StepAction",
     # checkpoint
     "AsyncCheckpointer",
-    # loop
-    "wrap",
     # trainer (Phase 4)
     "Trainer",
     "train",
@@ -56,4 +77,30 @@ __all__ = [
     # activation_checkpoint
     "CheckpointedBlock",
     "selective_checkpoint_wrapper",
+    # Phase 7: KV Cache Tiering
+    "BeladyKVCacheManager",
+    "T0_KV_BUDGET_BYTES",
+    "validate_bandwidth_corrected",
+    "validate_bandwidth_original",
+    # Phase 8: FP8 KV Quantization
+    "quantize_kv_fp8",
+    "dequantize_kv",
+    "smooth_swiglu_scale",
+    "GradientMonitor",
+    # Phase 9: Dynamic Ring Curriculum
+    "RingCurriculumManager",
+    "CurriculumConfig",
+    "compute_reshard_cost_optimistic",
+    "compute_reshard_cost_pessimistic",
 ]
+
+
+# Legacy submodule — wrap() from loop.py moved here for backward compat
+class legacy:  # noqa: N801
+    """Legacy training functions from loop.py (deprecated)."""
+
+    @staticmethod
+    def wrap(*args, **kwargs):  # type: ignore[no-untyped-def]
+        """Deprecated. Use zenyx.train.trainer.Trainer instead."""
+        from zenyx.train.loop import wrap as _legacy_wrap
+        return _legacy_wrap(*args, **kwargs)

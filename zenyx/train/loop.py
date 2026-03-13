@@ -251,6 +251,9 @@ def wrap(
 ) -> nn.Module:
     """Wrap a model with Zenyx memory management.
 
+    .. deprecated::
+        loop.py is deprecated. Use ``zenyx.train.trainer.Trainer`` instead.
+
     Hooks into forward/backward for FP8 E4M3 activation checkpointing.
 
     Parameters
@@ -271,6 +274,12 @@ def wrap(
     ----------
     Time *O(L)* where *L* = number of layers.
     """
+    import warnings
+    warnings.warn(
+        "loop.py is deprecated. Use zenyx.train.trainer.Trainer instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     model = fp8_checkpoint(
         model,
         every_n=fp8_every_n,
@@ -299,6 +308,9 @@ def _legacy_train(
     fp8_every_n: int = 4,
 ) -> Dict[str, Any]:
     """Legacy Phase 2 training entrypoint (internal use only).
+
+    .. deprecated::
+        loop.py is deprecated. Use ``zenyx.train.trainer.Trainer`` instead.
 
     Users call ``zenyx.train(model, dataloader)`` — everything else is
     auto-detected.  **Never raises** ``torch.cuda.OutOfMemoryError``.
@@ -336,6 +348,12 @@ def _legacy_train(
     Time *O(steps × (forward + backward + optimiser))*.
     """
     # ---- Step 1: Hardware detection ----
+    import warnings
+    warnings.warn(
+        "loop.py is deprecated. Use zenyx.train.trainer.Trainer instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     hw = hardware if hardware is not None else _detect_hardware()
     device = hw["device"]
     logger.info("Zenyx hardware: %s (%d devices)", hw["backend"], hw["device_count"])

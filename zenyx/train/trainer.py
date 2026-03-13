@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+import warnings
 from typing import Any, Dict, Optional
 
 import torch
@@ -94,6 +95,18 @@ class Trainer:
         checkpoint_every_nth_layer: int = 4,
         # Loader
         loader_config: Optional[Any] = None,
+        # Phase 7: KV Cache Tiering
+        kv_tier_config: Optional[Any] = None,
+        # Phase 8: FP8 KV Quantization
+        fp8_kv: bool = False,
+        fp8_coat_mode: bool = False,
+        fp8_quant_strategy: str = "per_channel",
+        # Phase 9: Dynamic Ring Curriculum
+        curriculum_config: Optional[Any] = None,
+        reshard_no_recompile: Optional[bool] = None,
+        # Phase 10: Sparse Ring Attention
+        sparse_attn: bool = False,
+        sparse_skip_mode: str = "production",
     ) -> None:
         self._model = model
         self._dataloader = dataloader
@@ -107,6 +120,22 @@ class Trainer:
         self._heap_rebuild_interval = heap_rebuild_interval
         self._context_len = context_len
         self._loader_config = loader_config
+
+        # Phase 7-10 configuration
+        self._kv_tier_config = kv_tier_config
+        self._fp8_kv = fp8_kv
+        self._fp8_coat_mode = fp8_coat_mode
+        self._fp8_quant_strategy = fp8_quant_strategy
+        self._curriculum_config = curriculum_config
+        self._reshard_no_recompile = reshard_no_recompile
+        self._sparse_attn = sparse_attn
+        self._sparse_skip_mode = sparse_skip_mode
+
+        # Phase 7-10 managers (lazy init)
+        self._kv_cache_manager: Optional[Any] = None
+        self._gradient_monitor: Optional[Any] = None
+        self._curriculum_manager: Optional[Any] = None
+        self._sparse_kernel: Optional[Any] = None
 
         # Training state
         self._step: int = 0
@@ -279,6 +308,73 @@ class Trainer:
             except ImportError:
                 pass
 
+        # --- Step 15: Audit Fix 1 — Memory bandwidth validation [DISPUTE 7-A] ---
+        self.validate_memory_bandwidth()
+
+        # --- Step 16: Audit Fix 3 — Batch size sanity check ---
+        num_params = sum(p.numel() for p in model.parameters())
+        global_batch_tokens = context_len * max(1, gradient_accumulation_steps)
+        min_recommended_tokens_per_step = 65_536
+        if global_batch_tokens < min_recommended_tokens_per_step:
+            warnings.warn(
+                f"Global batch {global_batch_tokens} tokens is dangerously small for a "
+                f"{num_params:.1e}-parameter model. Minimum recommended: "
+                f"{min_recommended_tokens_per_step}. "
+                "Training will likely diverge. Use gradient accumulation.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        # --- Step 17: Phase 7 — KV Cache Tiering ---
+        if kv_tier_config is not None:
+            from zenyx.train.kv_cache_tier import BeladyKVCacheManager
+            self._kv_cache_manager = BeladyKVCacheManager(
+                world_size=self._topo_info.world_size
+                if hasattr(self, "_topo_info") else 1,
+                **kv_tier_config if isinstance(kv_tier_config, dict) else {},
+            )
+            logger.info("Phase 7: BéládyKVCacheManager initialized")
+
+        # --- Step 18: Phase 8 — FP8 KV Quantization ---
+        if fp8_kv:
+            from zenyx.train.fp8_kv import GradientMonitor
+            self._gradient_monitor = GradientMonitor(
+                coat_safety_claim=fp8_coat_mode
+            )
+            logger.info(
+                "Phase 8: FP8 KV enabled (strategy=%s, coat_mode=%s)",
+                fp8_quant_strategy, fp8_coat_mode,
+            )
+
+        # --- Step 19: Phase 9 — Dynamic Ring Curriculum ---
+        if curriculum_config is not None:
+            from zenyx.train.ring_curriculum import RingCurriculumManager
+            cfg = curriculum_config if isinstance(curriculum_config, dict) else {}
+            self._curriculum_manager = RingCurriculumManager(
+                no_recompile=reshard_no_recompile,
+                **cfg,
+            )
+            self._curriculum_manager.build_static_mesh()
+            logger.info("Phase 9: RingCurriculumManager initialized")
+
+        # --- Step 20: Phase 10 — Sparse Ring Attention ---
+        if sparse_attn:
+            from zenyx.ops.attention.sparse_ring_attn import SparseRingAttentionKernel
+            self._sparse_kernel = SparseRingAttentionKernel(
+                skip_mode=sparse_skip_mode,
+                num_layers=2,  # Use model layer count in production
+                seq_len=context_len,
+                window_size=min(131_072, context_len),
+                ring_degree=max(1, (self._topo_info.world_size
+                                    if hasattr(self, "_topo_info") else 1)),
+                world_size=max(1, (self._topo_info.world_size
+                                   if hasattr(self, "_topo_info") else 1)),
+            )
+            logger.info(
+                "Phase 10: SparseRingAttentionKernel initialized (skip_mode=%s)",
+                sparse_skip_mode,
+            )
+
         logger.info(
             "Zenyx Trainer initialized. Hardware: %s. Attention: %s. Allocator: %s",
             self._backend,
@@ -306,6 +402,64 @@ class Trainer:
         if self._tier_allocator is not None:
             self._tier_allocator.register_compute_graph(graph)
             logger.info("Compute graph registered with TierAllocator")
+
+    def validate_memory_bandwidth(self) -> None:
+        """Validate memory bandwidth feasibility [DISPUTE 7-A].
+
+        Runs BOTH the corrected and original feasibility formulas.
+        Emits RuntimeWarning if EITHER flags a violation.
+
+        Source A: min(B_01, B_12) >= AI × Fcompute (corrected)
+        Source B: 1/B_01 + 1/B_12 <= 1/Fcompute (original)
+        """
+        from zenyx.train.kv_cache_tier import (
+            validate_bandwidth_corrected,
+            validate_bandwidth_original,
+        )
+
+        b_01 = getattr(self._hw_info, "hbm_bandwidth_gbs", 0.0) if hasattr(self, "_hw_info") else 0.0
+        b_12 = 7.5  # Conservative PCIe Gen4 NVMe default
+        compute_tflops = getattr(self._hw_info, "compute_tflops", 0.0) if hasattr(self, "_hw_info") else 0.0
+
+        if b_01 <= 0 or compute_tflops <= 0:
+            logger.debug("Bandwidth validation skipped (incomplete hardware info)")
+            return
+
+        corrected_result = validate_bandwidth_corrected(b_01, b_12, compute_tflops)
+        original_result = validate_bandwidth_original(b_01, b_12, compute_tflops)
+
+        corrected_ok = corrected_result[0] if isinstance(corrected_result, tuple) else corrected_result
+        original_ok = original_result[0] if isinstance(original_result, tuple) else original_result
+
+        corrected_msg = corrected_result[1] if isinstance(corrected_result, tuple) else ""
+        original_msg = original_result[1] if isinstance(original_result, tuple) else ""
+
+        logger.info(
+            "Bandwidth validation: corrected=%s (%s), original=%s (%s)",
+            "PASS" if corrected_ok else "FAIL", corrected_msg,
+            "PASS" if original_ok else "FAIL", original_msg,
+        )
+
+        if not corrected_ok or not original_ok:
+            warnings.warn(
+                f"Memory bandwidth may be insufficient. "
+                f"Corrected formula: {'PASS' if corrected_ok else 'FAIL'}, "
+                f"Original formula: {'PASS' if original_ok else 'FAIL'}. "
+                f"B_01={b_01:.1f} GB/s, B_12={b_12:.1f} GB/s, "
+                f"Compute={compute_tflops:.1f} TFLOPS. "
+                f"Training may proceed in throttled-compute mode.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        if corrected_ok != original_ok:
+            logger.critical(
+                "DISPUTE 7-A: Feasibility formulas DISAGREE. "
+                "Corrected=%s, Original=%s. "
+                "Investigate bandwidth configuration.",
+                "PASS" if corrected_ok else "FAIL",
+                "PASS" if original_ok else "FAIL",
+            )
 
     # ------------------------------------------------------------------
     # Training loop

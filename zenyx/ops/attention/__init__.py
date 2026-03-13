@@ -9,11 +9,30 @@ avoid requiring JAX on non-TPU systems.  Import it explicitly::
 from zenyx.ops.attention.flash_cpu import FlashAttentionCPU, flash_attention_cpu
 from zenyx.ops.attention.ring_flash_cuda import RingFlashAttention, RingFlashAttentionCUDA
 
+# Phase 10: Sparse Ring Attention
+from zenyx.ops.attention.sparse_ring_attn import (
+    SparseRingAttentionKernel,
+    compute_skip_schedule,
+    compute_skip_schedule_production,
+    compute_skip_schedule_theoretical,
+    build_hybrid_attention_mask,
+    SKIP_FRACTION_PRODUCTION,
+    SKIP_FRACTION_THEORETICAL,
+)
+
 __all__ = [
     "FlashAttentionCPU",
     "flash_attention_cpu",
     "RingFlashAttention",
     "RingFlashAttentionCUDA",
+    # Phase 10: Sparse Ring Attention
+    "SparseRingAttentionKernel",
+    "compute_skip_schedule",
+    "compute_skip_schedule_production",
+    "compute_skip_schedule_theoretical",
+    "build_hybrid_attention_mask",
+    "SKIP_FRACTION_PRODUCTION",
+    "SKIP_FRACTION_THEORETICAL",
 ]
 
 # Lazy import for TPU module — only expose when JAX is available
