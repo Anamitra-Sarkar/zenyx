@@ -344,3 +344,127 @@ class OverlappedAllReduce:
             f"inflight={len(self._inflight)}, "
             f"stats={self._stats})"
         )
+
+    # ── Phase 3 event-based API ──────────────────────────────────────
+
+    def launch_async(
+        self,
+        tensor: Any,
+        op: Any = None,
+        group: Any = None,
+    ) -> Any:
+        """Launch all-reduce on a background stream.
+
+        Parameters
+        ----------
+        tensor : torch.Tensor
+            Tensor to all-reduce in-place.
+        op : torch.distributed.ReduceOp | None
+            Reduce operation (default ``SUM``).
+        group : ProcessGroup | None
+            Process group (default → global group).
+
+        Returns
+        -------
+        torch.cuda.Event
+            Completion event — pass to :meth:`wait` to synchronise.
+
+        Time complexity:  O(numel) communication.
+        Space complexity: O(1).
+        """
+        if not _TORCH_AVAILABLE:
+            return None
+
+        if op is None:
+            op = dist.ReduceOp.SUM if (dist.is_available() and dist.is_initialized()) else None
+
+        effective_group = group or self._group
+
+        if not (dist.is_available() and dist.is_initialized()):
+            # Single-device: no-op, return a completion event immediately
+            if torch.cuda.is_available():
+                event = torch.cuda.Event()
+                event.record()
+                return event
+            return None
+
+        stream = self._comm_stream
+        if stream is not None:
+            with torch.cuda.stream(stream):
+                dist.all_reduce(tensor, op=op, group=effective_group, async_op=False)
+                event = torch.cuda.Event()
+                event.record(stream)
+        else:
+            dist.all_reduce(tensor, op=op, group=effective_group, async_op=False)
+            event = torch.cuda.Event() if torch.cuda.is_available() else None
+            if event is not None:
+                event.record()
+
+        return event
+
+    @staticmethod
+    def wait_event(event: Any) -> None:
+        """Wait for a previously launched all-reduce to complete.
+
+        Parameters
+        ----------
+        event : torch.cuda.Event
+            Event returned by :meth:`launch_async`.
+
+        Time complexity:  O(1) — waits for GPU completion.
+        Space complexity: O(1).
+        """
+        if event is None:
+            return
+        if _TORCH_AVAILABLE and torch.cuda.is_available():
+            torch.cuda.current_stream().wait_event(event)
+
+    def synchronous(
+        self,
+        tensor: Any,
+        op: Any = None,
+        group: Any = None,
+    ) -> Any:
+        """Blocking all-reduce.
+
+        Used when communication–computation overlap is not possible.
+
+        Parameters
+        ----------
+        tensor : torch.Tensor
+            Tensor to all-reduce in-place.
+        op : torch.distributed.ReduceOp | None
+            Reduce operation (default ``SUM``).
+        group : ProcessGroup | None
+            Process group.
+
+        Returns
+        -------
+        torch.Tensor
+            The all-reduced tensor (same object, mutated in-place).
+
+        Time complexity:  O(numel × log(world_size)).
+        Space complexity: O(1).
+        """
+        if not _TORCH_AVAILABLE:
+            return tensor
+
+        if op is None:
+            op = dist.ReduceOp.SUM if (dist.is_available() and dist.is_initialized()) else None
+
+        effective_group = group or self._group
+
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(tensor, op=op, group=effective_group, async_op=False)
+
+        return tensor
+
+
+if __name__ == "__main__":
+    # Self-test: run with world_size=1 (no distributed setup needed)
+    print("Testing OverlappedAllReduce...")
+    ar = OverlappedAllReduce(bucket_size_mb=25.0)
+    print(repr(ar))
+    # Without distributed, methods are no-ops
+    ar.wait()
+    print("PASSED")

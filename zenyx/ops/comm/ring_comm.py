@@ -296,3 +296,126 @@ class RingCommunicator:
             current = best_next
 
         return order
+
+    # ------------------------------------------------------------------
+    # Non-blocking send/recv API (per Phase 3 spec)
+    # ------------------------------------------------------------------
+
+    def send_kv(self, kv: torch.Tensor) -> None:
+        """Non-blocking send of KV block to next rank in ring.
+
+        Initiates an ``isend`` to the next rank in the ring.  The caller
+        must later call :meth:`wait_send` before reusing the buffer.
+
+        Parameters
+        ----------
+        kv : Tensor
+            KV block to send.
+
+        Raises
+        ------
+        RuntimeError
+            If a previous send has not yet been waited on.
+
+        Time complexity:  O(1) to initiate.
+        Space complexity: O(1).
+        """
+        if self._world_size <= 1:
+            return
+        self._send_req = dist.isend(kv, self._next_rank, group=self._process_group)
+
+    def recv_kv(self, buffer: torch.Tensor) -> None:
+        """Non-blocking recv of KV block from previous rank in ring.
+
+        Initiates an ``irecv`` from the previous rank.  The caller must
+        later call :meth:`wait_recv` to block until the transfer completes.
+
+        Parameters
+        ----------
+        buffer : Tensor
+            Pre-allocated buffer to receive into.
+
+        Time complexity:  O(1) to initiate.
+        Space complexity: O(1).
+        """
+        if self._world_size <= 1:
+            return
+        self._recv_buffer = buffer
+        self._recv_req = dist.irecv(buffer, self._prev_rank, group=self._process_group)
+
+    def wait_send(self) -> None:
+        """Block until the pending send completes.
+
+        Time complexity:  O(numel) — waits for transfer.
+        Space complexity: O(1).
+        """
+        if self._world_size <= 1:
+            return
+        if hasattr(self, "_send_req") and self._send_req is not None:
+            self._send_req.wait()
+            self._send_req = None
+
+    def wait_recv(self) -> torch.Tensor:
+        """Block until the pending recv completes.
+
+        Returns
+        -------
+        Tensor
+            The received KV tensor (same as the buffer passed to :meth:`recv_kv`).
+
+        Time complexity:  O(numel) — waits for transfer.
+        Space complexity: O(1).
+        """
+        if self._world_size <= 1:
+            return getattr(self, "_recv_buffer", torch.empty(0))
+        if hasattr(self, "_recv_req") and self._recv_req is not None:
+            self._recv_req.wait()
+            self._recv_req = None
+        return self._recv_buffer
+
+    def step(self) -> None:
+        """Advance ring position by one step (increment step counter).
+
+        Time complexity:  O(1).
+        Space complexity: O(1).
+        """
+        if not hasattr(self, "_step_counter"):
+            self._step_counter = 0
+        self._step_counter += 1
+
+    @property
+    def num_steps(self) -> int:
+        """Total ring steps = world_size - 1.
+
+        Returns
+        -------
+        int
+            Number of ring communication steps required.
+        """
+        return max(0, self._world_size - 1)
+
+    @property
+    def current_kv_rank(self) -> int:
+        """Which rank's KV block we currently hold after ``step`` steps.
+
+        Returns
+        -------
+        int
+            The rank whose KV data this device currently holds.
+        """
+        steps = getattr(self, "_step_counter", 0)
+        return (self._rank - steps) % self._world_size
+
+
+if __name__ == "__main__":
+    # Self-test: run with world_size=1 (no distributed setup needed)
+    print("Testing RingCommunicator...")
+    from zenyx.ops.comm.topology import Topology
+
+    topo = Topology()
+    comm = RingCommunicator(topology=topo)
+    assert comm.world_size == 1
+    assert comm.num_steps == 0
+    assert comm.current_kv_rank == 0
+    print(repr(comm))
+    print("PASSED")

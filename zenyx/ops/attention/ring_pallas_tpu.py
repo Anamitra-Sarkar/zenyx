@@ -20,7 +20,7 @@ import logging
 import math
 from typing import Any, Callable, Optional, Sequence, Tuple
 
-__all__ = ["RingFlashAttentionTPU"]
+__all__ = ["RingFlashAttentionTPU", "ring_attention_tpu"]
 
 logger = logging.getLogger(__name__)
 
@@ -366,3 +366,80 @@ class RingFlashAttentionTPU:
     ) -> Any:
         """Alias for :meth:`forward`."""
         return self.forward(q, k, v, axis_name)
+
+
+# ---------------------------------------------------------------------------
+# ring_attention_tpu — Phase 3 convenience function
+# ---------------------------------------------------------------------------
+
+
+def ring_attention_tpu(
+    q: Any,
+    k: Any,
+    v: Any,
+    axis_name: str = "devices",
+    causal: bool = True,
+) -> Any:
+    """Ring Attention for TPU v5e/v5p using Pallas + Shardy.
+
+    The sequence dimension is sharded across devices via ``pmap``/``shard_map``.
+    Each device holds ``seq_local = seq_total / num_devices`` tokens.
+
+    Communication uses ``lax.ppermute`` inside ``custom_partitioning`` boundaries
+    so XLA cannot reorder it relative to the Pallas attention kernel.
+
+    S_min for TPU v5e ICI = 493 tokens (F=197 TFLOPS, B=400 GB/s).
+    S_min for TPU v5p ICI = 383 tokens (F=459 TFLOPS, B=1200 GB/s).
+
+    Parameters
+    ----------
+    q : jax.Array
+        ``(batch, seq_local, num_heads, head_dim)`` — local query chunk.
+    k : jax.Array
+        ``(batch, seq_local, num_kv_heads, head_dim)`` — local key chunk.
+    v : jax.Array
+        ``(batch, seq_local, num_kv_heads, head_dim)`` — local value chunk.
+    axis_name : str
+        Name of the device axis for ``pmap``/``shard_map`` (default ``"devices"``).
+    causal : bool
+        Apply causal masking (default ``True``).
+
+    Returns
+    -------
+    jax.Array
+        ``(batch, seq_local, num_heads, head_dim)`` — attention output.
+
+    Raises
+    ------
+    ImportError
+        If JAX is not installed.
+
+    Time complexity:  O(P × S_local² × D) where P = ring size
+    Space complexity: O(S_local × H × D)
+    """
+    if not _HAS_JAX:
+        raise ImportError(
+            "JAX is not installed. Install with: pip install jax[tpu]"
+        )
+
+    # Infer head_dim from the last dimension
+    head_dim = q.shape[-1] if hasattr(q, "shape") else 128
+    attn = RingFlashAttentionTPU(head_dim=head_dim, causal=causal)
+    return attn(q, k, v, axis_name=axis_name)
+
+
+if __name__ == "__main__":
+    # Self-test: verify module imports without JAX
+    print("Testing ring_pallas_tpu module...")
+    if _HAS_JAX:
+        print("JAX available — RingFlashAttentionTPU instantiable")
+        attn = RingFlashAttentionTPU(head_dim=64)
+        print(repr(attn))
+    else:
+        print("JAX not available — verifying graceful fallback")
+        try:
+            ring_attention_tpu(None, None, None)
+            assert False, "Should have raised ImportError"
+        except ImportError as e:
+            print(f"Correctly raised: {e}")
+    print("PASSED")

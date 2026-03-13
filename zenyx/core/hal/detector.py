@@ -135,16 +135,16 @@ def _detect_cuda() -> HardwareInfo | None:
     if device_count > 1 and interconnect == "pcie":
         interconnect = _probe_nvlink()
 
-    # Bandwidth estimates (conservative)
-    # PCIe Gen4 x16 ≈ 32 GB/s, NVLink 4 ≈ 450 GB/s per direction
+    # Bandwidth estimates
+    # PCIe Gen5 x16 ≈ 64 GB/s, PCIe Gen4 x16 ≈ 32 GB/s
     bw_t0_t1: float
     if interconnect == "nvlink":
-        bw_t0_t1 = 32.0 * (1024 ** 3)  # host↔device still PCIe
+        bw_t0_t1 = 64.0 * (1024 ** 3)  # host↔device PCIe Gen5
     else:
-        bw_t0_t1 = 32.0 * (1024 ** 3)
+        bw_t0_t1 = 32.0 * (1024 ** 3)  # PCIe Gen4 fallback
 
-    # NVMe Gen4 ≈ 7 GB/s sequential
-    bw_t1_t2 = 7.0 * (1024 ** 3)
+    # NVMe Gen5 ≈ 14 GB/s, Gen4 ≈ 7 GB/s
+    bw_t1_t2 = 14.0 * (1024 ** 3)
 
     logger.info(
         "CUDA detected: %d × %s (%.1f TFLOPS FP16, %s)",
