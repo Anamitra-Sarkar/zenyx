@@ -20,7 +20,10 @@ from typing import Any, Dict, List, Optional
 
 from zenyx.core.hal.base import HALBase, MemBlock, MemTier, _human_bytes
 from zenyx.core.hal.detector import HardwareInfo, build_hal_for_hardware
-from zenyx.core.allocator.feasibility import check_feasibility
+from zenyx.core.allocator.feasibility import (
+    check_feasibility,
+    compute_throughput_from_hardware,
+)
 
 try:
     import torch
@@ -100,7 +103,7 @@ class MemoryPool:
 
     On construction:
       1. Runs :func:`check_feasibility` and logs a warning if the bandwidth
-         condition is not met.
+         condition is not met (throttle mode — never crashes).
       2. Pre-allocates capacity for T0 (90 % of available VRAM), T1 (pinned
          CPU), and T2 (mmap-backed NVMe).
 
@@ -109,16 +112,17 @@ class MemoryPool:
       * If that tier is full, evicts the **least-recently-used** block to the
         next lower tier, then retries.
       * If T2 is full, **blocks** (throttles) until space is available.
-      * **Never** raises OOM.
+      * **Never** raises an OOM exception.
 
     Args:
         hw_info:          Hardware description from :func:`detect_hardware`.
+        block_size_mb:    Block granularity in MiB (clamped 2–20).
         t0_reserve_frac:  Fraction of per-device memory to reserve as T0 (default 0.9).
         t1_capacity:      T1 pool size in bytes (default 8 GiB).
         t2_capacity:      T2 pool size in bytes (default 64 GiB).
-        compute_throughput: Compute throughput in bytes/sec for feasibility check.
-                            If ``None``, uses ``hw_info.compute_tflops × 1e12 × 2``
-                            (FLOP → bytes for FP16).
+        compute_throughput: Compute throughput in **bytes/sec** for feasibility check.
+                            If ``None``, derived from ``hw_info.compute_tflops`` via
+                            :func:`compute_throughput_from_hardware` (correct units).
 
     Time complexity:  O(1) for construction.
     Space complexity: O(T0 + T1 + T2 capacities).
@@ -150,15 +154,20 @@ class MemoryPool:
         }
 
         # ---- feasibility check --------------------------------------------
-        ct = compute_throughput
-        if ct is None:
-            # Convert TFLOPS → bytes/sec (FP16: 2 bytes per FLOP output)
-            ct = hw_info.compute_tflops * 1e12 * 2.0
+        # FIX: compute_throughput must be in bytes/sec, not raw TFLOPS.
+        # Previously this used `hw_info.compute_tflops * 1e12 * 2.0` which
+        # is FLOP/sec — wrong units.  Now we use compute_throughput_from_hardware()
+        # which divides by arithmetic intensity (16 FLOP/byte for BF16 matmul)
+        # to get the correct bytes/sec equivalent.
+        if compute_throughput is None:
+            compute_throughput = compute_throughput_from_hardware(
+                hw_info.compute_tflops
+            )
 
         self._feasibility = check_feasibility(
             bandwidth_t0_t1=hw_info.bandwidth_t0_t1,
             bandwidth_t1_t2=hw_info.bandwidth_t1_t2,
-            compute_throughput=ct,
+            compute_throughput=compute_throughput,
         )
         if not self._feasibility.is_feasible:
             logger.warning(
@@ -208,30 +217,23 @@ class MemoryPool:
         aligned = _align_up(max(size_bytes, MIN_BLOCK_SIZE))
 
         with self._lock:
-            # Try preferred tier and each lower tier in order
             for tier in _tier_fallback_chain(preferred_tier):
                 state = self._tiers[tier]
 
-                # If there's room, allocate directly
                 if state.free >= aligned:
                     return self._do_alloc(aligned, tier)
 
-                # Try evicting from this tier to the next lower tier
                 if tier != MemTier.T2:
                     freed = self._evict_until(tier, aligned)
                     if freed and state.free >= aligned:
                         return self._do_alloc(aligned, tier)
 
-            # All tiers exhausted — throttle on T2 until space frees up
             logger.warning(
                 "All tiers full — throttling until %s freed on T2",
                 _human_bytes(aligned),
             )
 
-        # Release lock while blocking to allow other threads to free memory
         self._throttle_wait(aligned)
-
-        # Retry after throttle
         return self.allocate(size_bytes, MemTier.T2)
 
     def _do_alloc(self, size: int, tier: MemTier) -> MemBlock:
@@ -262,9 +264,6 @@ class MemoryPool:
     def evict(self, block: MemBlock, target_tier: MemTier) -> MemBlock:
         """Move *block* to *target_tier* (must be a lower / slower tier).
 
-        The copy is asynchronous; the old block is freed after the copy
-        completes.
-
         Args:
             block:       Block to evict.
             target_tier: Destination tier (must have ``target_tier > block.tier``).
@@ -289,10 +288,8 @@ class MemoryPool:
             new_state.allocated += new_block.size_bytes
             new_state.blocks[new_block.block_id] = new_block
 
-        # Copy data (async — HAL handles streams / thread pool)
         self._hal.copy(block, new_block)
 
-        # Free the old block
         with self._lock:
             old_state = self._tiers[block.tier]
             old_state.blocks.pop(block.block_id, None)
@@ -312,16 +309,7 @@ class MemoryPool:
     def _evict_until(self, tier: MemTier, needed: int) -> bool:
         """Evict LRU blocks from *tier* until *needed* bytes are free.
 
-        Caller must hold ``self._lock``.  Eviction targets the next lower
-        tier.  Uses a two-phase pattern: bookkeeping under the lock, then
-        blocking copies outside the lock so other threads can proceed.
-
-        Args:
-            tier:   Tier to evict from.
-            needed: Bytes required.
-
-        Returns:
-            ``True`` if sufficient space was freed.
+        Caller must hold ``self._lock``.
 
         Time complexity:  O(E) where E = number of blocks evicted.
         Space complexity: O(1) per eviction.
@@ -336,29 +324,21 @@ class MemoryPool:
 
             target_state = self._tiers[target_tier]
 
-            # PHASE 1: Under the lock — claim blocks, update bookkeeping,
-            # allocate destination buffers.
             blocks_to_copy: List[tuple[MemBlock, MemBlock]] = []
 
             while state.free < needed and state.blocks:
-                # Pop the oldest (LRU) block
                 oldest_id, oldest_block = next(iter(state.blocks.items()))
 
-                # Check target tier has room
                 if target_state.free < oldest_block.size_bytes:
-                    # Can't evict further — target tier is also full
-                    # Try evicting from target tier recursively
                     if target_tier != MemTier.T2:
                         self._evict_until(target_tier, oldest_block.size_bytes)
                     if target_state.free < oldest_block.size_bytes:
                         break
 
-                # Allocate on target tier (HAL alloc is fast pool sub-allocation)
                 new_block = self._hal.alloc(oldest_block.size_bytes, target_tier)
                 target_state.allocated += new_block.size_bytes
                 target_state.blocks[new_block.block_id] = new_block
 
-                # Remove old block from current tier bookkeeping
                 state.blocks.pop(oldest_id, None)
                 state.allocated = max(0, state.allocated - oldest_block.size_bytes)
 
@@ -366,7 +346,6 @@ class MemoryPool:
 
             result = state.free >= needed
 
-            # PHASE 2: perform copies with recursion-safe lock behavior.
             if blocks_to_copy and self._evict_depth == 1:
                 self._lock.release()
                 try:
@@ -385,12 +364,6 @@ class MemoryPool:
                 for src, dst in blocks_to_copy:
                     self._hal.copy(src, dst)
                     self._hal.free(src)
-                    logger.debug(
-                        "LRU evict (inline): %s → %s (%s)",
-                        tier,
-                        target_tier,
-                        _human_bytes(src.size_bytes),
-                    )
 
             return result
         finally:
@@ -402,8 +375,6 @@ class MemoryPool:
 
     def prefetch(self, block: MemBlock, target_tier: MemTier) -> MemBlock:
         """Move *block* to a higher (faster) tier.
-
-        Inverse of :meth:`evict` — promotes data towards T0.
 
         Args:
             block:       Block to promote.
@@ -426,7 +397,6 @@ class MemoryPool:
         with self._lock:
             state = self._tiers[target_tier]
 
-            # Ensure room on target tier — evict if necessary
             if state.free < block.size_bytes:
                 self._evict_until(target_tier, block.size_bytes)
 
@@ -442,10 +412,8 @@ class MemoryPool:
             state.allocated += new_block.size_bytes
             state.blocks[new_block.block_id] = new_block
 
-        # Copy data up
         self._hal.copy(block, new_block)
 
-        # Free old block from lower tier
         with self._lock:
             old_state = self._tiers[block.tier]
             old_state.blocks.pop(block.block_id, None)
@@ -481,8 +449,6 @@ class MemoryPool:
             state.allocated = max(0, state.allocated - block.size_bytes)
 
         self._hal.free(block)
-
-        # Signal any throttle-waiters that space may have freed up
         self._throttle_event.set()
 
     # ------------------------------------------------------------------
@@ -493,10 +459,18 @@ class MemoryPool:
         """Block until *needed* bytes are available on T2.
 
         This implements the "never crash, just slow" guarantee.
+        Has a hard ceiling of ``timeout`` seconds — if nothing has freed
+        memory after that, raises ``RuntimeError`` with a diagnostic
+        message so the user knows to call ``allocator.free()``.
 
         Args:
             needed:  Bytes required.
-            timeout: Maximum wait in seconds before retrying.
+            timeout: Maximum total wait in seconds before giving up.
+
+        Raises:
+            RuntimeError: If ``timeout`` elapses with no space freed.
+                          This is NOT an OOM — it means the caller never
+                          freed previously allocated blocks.
 
         Time complexity:  O(1) per wait cycle.
         Space complexity: O(1).
@@ -507,13 +481,29 @@ class MemoryPool:
             with self._lock:
                 if self._tiers[MemTier.T2].free >= needed:
                     return
-            # Wait for a free() call to signal us
             self._throttle_event.wait(timeout=1.0)
 
-        logger.warning(
-            "Throttle timeout (%.0fs) — retrying allocation of %s",
-            timeout,
-            _human_bytes(needed),
+        # Build diagnostic showing what is occupying each tier
+        with self._lock:
+            t0 = self._tiers[MemTier.T0]
+            t1 = self._tiers[MemTier.T1]
+            t2 = self._tiers[MemTier.T2]
+            diag = (
+                f"T0: {_human_bytes(t0.allocated)}/{_human_bytes(t0.capacity)} "
+                f"({len(t0.blocks)} blocks), "
+                f"T1: {_human_bytes(t1.allocated)}/{_human_bytes(t1.capacity)} "
+                f"({len(t1.blocks)} blocks), "
+                f"T2: {_human_bytes(t2.allocated)}/{_human_bytes(t2.capacity)} "
+                f"({len(t2.blocks)} blocks)"
+            )
+
+        raise RuntimeError(
+            f"Zenyx TierAllocator: all three memory tiers remain full after "
+            f"{timeout:.0f}s throttle wait — {_human_bytes(needed)} needed on T2.\n"
+            f"Tier usage: {diag}\n"
+            f"Fix: call allocator.free(block) on blocks that are no longer "
+            f"needed before allocating new ones. In a training loop, free "
+            f"KV cache blocks at the end of each step."
         )
 
     # ------------------------------------------------------------------
@@ -533,15 +523,11 @@ class MemoryPool:
             }
 
     def get_cuda_pool(self) -> Optional[Any]:
-        """Return the ``torch.cuda.MemPool`` for use as context manager
-        around ``torch.compile`` graph capture.
-
-        Must be called before any ``torch.compile(...)`` call to ensure
-        CUDA Graph address stability.
+        """Return the ``torch.cuda.MemPool`` for CUDA Graph capture.
 
         Returns:
             The ``torch.cuda.MemPool`` instance, or ``None`` if CUDA is
-            not available or the pool was not created.
+            not available.
 
         Time complexity:  O(1).
         Space complexity: O(1).
@@ -568,13 +554,7 @@ class MemoryPool:
 
 
 def _tier_fallback_chain(preferred: MemTier) -> List[MemTier]:
-    """Return tier fallback order starting from *preferred*.
-
-    E.g. ``_tier_fallback_chain(MemTier.T0)`` → ``[T0, T1, T2]``.
-
-    Time complexity:  O(1).
-    Space complexity: O(1).
-    """
+    """Return tier fallback order starting from *preferred*."""
     tiers = [MemTier.T0, MemTier.T1, MemTier.T2]
     start = tiers.index(preferred)
     return tiers[start:]

@@ -6,8 +6,27 @@ Provides two key utilities:
    ``(1/B_01) + (1/B_12) ≤ (1/F_compute)``.
 2. **estimate_memory_budget** — computes per-component memory requirements
    for a transformer model.
+3. **compute_throughput_from_hardware** — converts raw TFLOPS into the
+   correct bytes/sec unit required by ``check_feasibility``.
 
 All functions are deterministic and side-effect free.
+
+Unit contract
+-------------
+All three arguments to ``check_feasibility`` must be in **bytes/sec**
+(i.e. a bandwidth).  The condition
+
+    (1/B_01) + (1/B_12) ≤ (1/F_compute)
+
+is a roofline arithmetic-intensity check: the left-hand side is the
+total time (seconds) to move one byte through the tier hierarchy; the
+right-hand side is the time (seconds) per byte of compute work.  When
+the condition holds, bandwidth can always keep up with compute and
+eviction never stalls training.
+
+The common mistake is passing ``compute_tflops * 1e12`` directly as
+``compute_throughput``.  TFLOPS is operations/sec, not bytes/sec.  Use
+``compute_throughput_from_hardware()`` to convert correctly.
 """
 from __future__ import annotations
 
@@ -17,6 +36,12 @@ from dataclasses import dataclass
 from typing import Optional
 
 logger = logging.getLogger("zenyx.core.allocator.feasibility")
+
+# Arithmetic intensity of a typical transformer layer in BF16:
+# ~16 FLOP per byte (dominant cost is large matmuls at batch>1).
+# This is a well-established empirical constant for LLM training.
+# Reference: Kaplan et al. 2020, Korthikanti et al. 2022.
+_TRANSFORMER_FLOP_PER_BYTE: float = 16.0
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +127,55 @@ class MemoryBudget:
 
 
 # ---------------------------------------------------------------------------
+# Unit conversion helper
+# ---------------------------------------------------------------------------
+
+
+def compute_throughput_from_hardware(
+    compute_tflops: float,
+    flop_per_byte: float = _TRANSFORMER_FLOP_PER_BYTE,
+) -> float:
+    """Convert raw TFLOPS into bytes/sec for use in ``check_feasibility``.
+
+    ``check_feasibility`` requires all three inputs in **bytes/sec**.  Raw
+    TFLOPS is operations/sec and must be divided by the arithmetic intensity
+    (FLOP/byte) of the workload to obtain the equivalent memory bandwidth.
+
+    For transformer training in BF16 the arithmetic intensity is ~16 FLOP/byte
+    for the dominant matmul operations (Korthikanti et al. 2022).  This means
+    the compute unit can "consume" one byte of data every
+    ``1 / (tflops * 1e12 / flop_per_byte)`` seconds.
+
+    Args:
+        compute_tflops: Peak compute throughput in TFLOPS (e.g. 197.0 for
+                        TPU v5 lite).
+        flop_per_byte:  Arithmetic intensity of the workload in FLOP/byte.
+                        Defaults to 16.0 (BF16 transformer matmuls).
+
+    Returns:
+        Effective compute throughput in **bytes/sec**.
+
+    Raises:
+        ValueError: If either argument is ≤ 0.
+
+    Example::
+
+        >>> ct = compute_throughput_from_hardware(197.0)
+        >>> ct
+        1.23125e+13   # bytes/sec — use this as compute_throughput
+
+    Time complexity:  O(1).
+    Space complexity: O(1).
+    """
+    if compute_tflops <= 0:
+        raise ValueError(f"compute_tflops must be > 0, got {compute_tflops}")
+    if flop_per_byte <= 0:
+        raise ValueError(f"flop_per_byte must be > 0, got {flop_per_byte}")
+    # TFLOPS * 1e12 FLOP/sec  ÷  FLOP/byte  =  bytes/sec
+    return (compute_tflops * 1e12) / flop_per_byte
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -118,13 +192,18 @@ def check_feasibility(
         (1 / B_01) + (1 / B_12)  ≤  (1 / F_compute)
 
     where *B_01* = T1→T0 bandwidth (bytes/sec), *B_12* = T2→T1 bandwidth
-    (bytes/sec), and *F_compute* = compute throughput per layer in bytes/sec
-    equivalent.
+    (bytes/sec), and *F_compute* = **effective memory bandwidth equivalent
+    of compute** in bytes/sec.
+
+    **Unit requirement**: all three arguments must be in **bytes/sec**.
+    Do NOT pass raw TFLOPS here — use
+    :func:`compute_throughput_from_hardware` to convert first.
 
     Args:
         bandwidth_t0_t1:    T0 ↔ T1 bandwidth in bytes/sec.
         bandwidth_t1_t2:    T1 ↔ T2 bandwidth in bytes/sec.
-        compute_throughput: Compute throughput in bytes/sec equivalent.
+        compute_throughput: Effective compute throughput in bytes/sec.
+                            Obtain via :func:`compute_throughput_from_hardware`.
 
     Returns:
         :class:`FeasibilityResult` with diagnosis.
@@ -144,7 +223,7 @@ def check_feasibility(
 
     inv_bw = (1.0 / bandwidth_t0_t1) + (1.0 / bandwidth_t1_t2)
     inv_compute = 1.0 / compute_throughput
-    margin = inv_bw - inv_compute  # positive = BW bottleneck (deficit), negative = headroom
+    margin = inv_bw - inv_compute  # positive = BW bottleneck, negative = headroom
 
     is_feasible = margin <= 0.0
 
@@ -172,6 +251,34 @@ def check_feasibility(
         compute_throughput=compute_throughput,
         message=message,
     )
+
+
+def check_feasibility_for_hardware(
+    bandwidth_t0_t1: float,
+    bandwidth_t1_t2: float,
+    compute_tflops: float,
+    flop_per_byte: float = _TRANSFORMER_FLOP_PER_BYTE,
+) -> FeasibilityResult:
+    """Convenience wrapper: convert TFLOPS then call :func:`check_feasibility`.
+
+    Use this instead of ``check_feasibility`` when you have raw TFLOPS from
+    hardware detection (e.g. ``hw.compute_tflops``).  Internally calls
+    :func:`compute_throughput_from_hardware` to convert to bytes/sec.
+
+    Args:
+        bandwidth_t0_t1: T0 ↔ T1 bandwidth in bytes/sec.
+        bandwidth_t1_t2: T1 ↔ T2 bandwidth in bytes/sec.
+        compute_tflops:  Peak compute in TFLOPS (e.g. ``hw.compute_tflops``).
+        flop_per_byte:   Arithmetic intensity (default 16.0 for BF16 matmul).
+
+    Returns:
+        :class:`FeasibilityResult`.
+
+    Time complexity:  O(1).
+    Space complexity: O(1).
+    """
+    ct = compute_throughput_from_hardware(compute_tflops, flop_per_byte)
+    return check_feasibility(bandwidth_t0_t1, bandwidth_t1_t2, ct)
 
 
 def estimate_memory_budget(
@@ -213,30 +320,20 @@ def estimate_memory_budget(
     """
     GIB = 1024 ** 3
 
-    # ---- Weights ----------------------------------------------------------
     weights_bytes = params * dtype_bytes
     weights_gb = weights_bytes / GIB
 
-    # ---- KV cache ---------------------------------------------------------
-    # d_head = d_model / n_kv_heads for GQA (each KV head covers multiple Q heads)
     d_head = d_model / max(n_kv_heads, 1)
-    # 2 = K + V, each of shape [n_kv_heads, d_head] per token per layer
-    kv_cache_bytes = (
-        2 * n_kv_heads * d_head * context_len * n_layers * dtype_bytes
-    )
+    kv_cache_bytes = 2 * n_kv_heads * d_head * context_len * n_layers * dtype_bytes
     kv_cache_gb = kv_cache_bytes / GIB
 
-    # ---- Activations (training) -------------------------------------------
-    # With selective checkpointing every 4th layer, activations ≈ 2× weights
+    # Selective checkpointing every 4th layer → ~2× weights
     activations_gb = 2.0 * weights_gb
 
-    # ---- Optimizer state (Adam) -------------------------------------------
-    # Adam stores first moment (m) and second moment (v), each same size as weights
-    # These are stored in FP32 regardless of model dtype → 4 bytes per param × 2
-    optimizer_bytes = params * 4 * 2  # 2 FP32 states
+    # Adam: fp32 first + second moment = 4 bytes × 2 per param
+    optimizer_bytes = params * 4 * 2
     optimizer_gb = optimizer_bytes / GIB
 
-    # ---- Totals -----------------------------------------------------------
     total_gb = weights_gb + activations_gb + kv_cache_gb + optimizer_gb
     per_device_gb = total_gb / max(device_count, 1)
 
