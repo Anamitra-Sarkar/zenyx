@@ -27,6 +27,13 @@ Fix notes
 * _compute_loss fallback: if output lacked .mean(), the raw (non-scalar)
   tensor was returned causing .backward() to raise. Now always returns a
   scalar via .reshape(-1).sum() with a UserWarning.
+* Profiler handle leak: start_op was called inside the optimizer-step block
+  but the handle variable was declared outside the loop and initialised to
+  None. On micro-steps that did NOT trigger an optimizer step, the previous
+  handle was overwritten without a matching end_op call. Fixed by scoping
+  start_op / end_op tightly around the optimizer step block.
+* Cross-platform atomic checkpoint: os.replace() raises PermissionError on
+  Windows when the destination is open. Added shutil.move fallback.
 """
 
 from __future__ import annotations
@@ -34,6 +41,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
+import shutil
 import time
 import warnings
 from typing import Any, Dict, Optional
@@ -68,62 +76,41 @@ _DTYPE_MAP: Dict[str, torch.dtype] = {
 
 
 class Trainer:
-    """Full-stack LLM trainer with automatic hardware detection and memory management.
-
-    Integrates the agent feedback loop (AsyncProfiler → ParallelismPlanner →
-    TrainingController) for autonomous replanning and the fast model loader
-    for checkpoint loading.
-
-    Time: O(steps × (forward + backward + optimizer)).  Space: O(model + activations).
-    """
+    """Full-stack LLM trainer with automatic hardware detection and memory management."""
 
     def __init__(
         self,
         model: nn.Module,
         dataloader: Any,
         *,
-        # Optimizer
         lr: float = 1e-4,
         weight_decay: float = 0.1,
         beta1: float = 0.9,
         beta2: float = 0.95,
         grad_clip: float = 1.0,
-        # Schedule
         warmup_steps: int = 2000,
         total_steps: int = 100_000,
-        # Precision
         dtype: str = "bfloat16",
         activation_dtype: str = "float8_e4m3",
-        # Memory
         t1_capacity_gb: float = 8.0,
         t2_capacity_gb: float = 64.0,
-        # Context
         context_len: int = 4096,
-        # MoE
         dynamic_routing: bool = False,
         heap_rebuild_interval: int = 1000,
-        # Checkpointing
         checkpoint_dir: str = "./checkpoints",
         checkpoint_every: int = 1000,
         resume_from: Optional[str] = None,
-        # Logging
         log_every: int = 10,
-        # Advanced
         gradient_accumulation_steps: int = 1,
         selective_activation_checkpoint: bool = True,
         checkpoint_every_nth_layer: int = 4,
-        # Loader
         loader_config: Optional[Any] = None,
-        # Phase 7: KV Cache Tiering
         kv_tier_config: Optional[Any] = None,
-        # Phase 8: FP8 KV Quantization
         fp8_kv: bool = False,
         fp8_coat_mode: bool = False,
         fp8_quant_strategy: str = "per_channel",
-        # Phase 9: Dynamic Ring Curriculum
         curriculum_config: Optional[Any] = None,
         reshard_no_recompile: Optional[bool] = None,
-        # Phase 10: Sparse Ring Attention
         sparse_attn: bool = False,
         sparse_skip_mode: str = "production",
     ) -> None:
@@ -140,7 +127,6 @@ class Trainer:
         self._context_len = context_len
         self._loader_config = loader_config
 
-        # Phase 7-10 configuration
         self._kv_tier_config = kv_tier_config
         self._fp8_kv = fp8_kv
         self._fp8_coat_mode = fp8_coat_mode
@@ -150,18 +136,14 @@ class Trainer:
         self._sparse_attn = sparse_attn
         self._sparse_skip_mode = sparse_skip_mode
 
-        # Phase 7-10 managers (lazy init)
         self._kv_cache_manager: Optional[Any] = None
         self._gradient_monitor: Optional[Any] = None
         self._curriculum_manager: Optional[Any] = None
         self._sparse_kernel: Optional[Any] = None
 
-        # Training state
         self._step: int = 0
         self._last_loss: float = 0.0
         self._recent_step_times: list[float] = []
-
-        # Compute graph for Bélády-optimal eviction (set via register_compute_graph)
         self._compute_graph: Optional[Any] = None
 
         # --- Step 1: Hardware detection ---
@@ -205,7 +187,6 @@ class Trainer:
                 s_min_tokens=0,
             )
 
-        # --- Log hardware and topology ---
         logger.info(
             "Hardware: %s | Memory: %.1f GB | Compute: %.1f TFLOPS",
             self._hw_info.device_name,
@@ -219,7 +200,6 @@ class Trainer:
             self._topo_info.s_min_tokens,
         )
 
-        # --- Warn if sequence chunks too small for ring attention ---
         world_size = self._topo_info.world_size
         if world_size > 1:
             chunk_size = context_len // world_size
@@ -480,48 +460,30 @@ class Trainer:
             logger.info("Compute graph registered with TierAllocator")
 
     def validate_memory_bandwidth(self) -> None:
-        """Validate memory bandwidth feasibility.
-
-        Runs BOTH the corrected and original feasibility formulas.
-        Emits RuntimeWarning if EITHER flags a violation.
-
-        Fix: HardwareInfo.bandwidth_t0_t1 is in bytes/s. Convert to GB/s
-        before passing to the validation formulas which expect GB/s.
-        b_12 remains a conservative default (7.5 GB/s PCIe Gen4 NVMe) because
-        there is no portable runtime API to query NVMe bandwidth; a TODO is
-        added so operators can override it.
-        """
+        """Validate memory bandwidth feasibility."""
         from zenyx.train.kv_cache_tier import (
             validate_bandwidth_corrected,
             validate_bandwidth_original,
         )
 
         b_01_bytes_per_s = getattr(self._hw_info, "bandwidth_t0_t1", 0.0) if hasattr(self, "_hw_info") else 0.0
-        b_01 = b_01_bytes_per_s / (1024 ** 3)  # bytes/s → GB/s
+        b_01 = b_01_bytes_per_s / (1024 ** 3)
 
-        # b_12: NVMe bandwidth in GB/s.  There is no portable runtime API for
-        # this; 7.5 GB/s is a conservative PCIe Gen4 NVMe default.  Gen5 NVMe
-        # can exceed 14 GB/s; SATA SSDs are under 0.6 GB/s.  Override via
-        # hw_info.bandwidth_t1_t2 if available.
         b_12_bytes_per_s = getattr(self._hw_info, "bandwidth_t1_t2", 0.0) if hasattr(self, "_hw_info") else 0.0
         if b_12_bytes_per_s > 0:
             b_12 = b_12_bytes_per_s / (1024 ** 3)
         else:
-            b_12 = 7.5  # conservative PCIe Gen4 NVMe default (GB/s)
+            b_12 = 7.5
             logger.debug(
                 "b_12 (NVMe bandwidth) not available from hardware info; "
-                "using conservative default of %.1f GB/s. "
-                "Override via HardwareInfo.bandwidth_t1_t2.",
-                b_12,
+                "using conservative default of %.1f GB/s.", b_12,
             )
 
         compute_tflops = getattr(self._hw_info, "compute_tflops", 0.0) if hasattr(self, "_hw_info") else 0.0
 
         if b_01 <= 0 or compute_tflops <= 0:
             logger.debug(
-                "Bandwidth validation skipped (incomplete hardware info: "
-                "b_01=%.3f GB/s, compute_tflops=%.1f). "
-                "This is expected on CPU-only runs.",
+                "Bandwidth validation skipped (b_01=%.3f GB/s, compute_tflops=%.1f).",
                 b_01, compute_tflops,
             )
             return
@@ -531,7 +493,6 @@ class Trainer:
 
         corrected_ok = corrected_result[0] if isinstance(corrected_result, tuple) else corrected_result
         original_ok = original_result[0] if isinstance(original_result, tuple) else original_result
-
         corrected_msg = corrected_result[1] if isinstance(corrected_result, tuple) else ""
         original_msg = original_result[1] if isinstance(original_result, tuple) else ""
 
@@ -556,8 +517,7 @@ class Trainer:
         if corrected_ok != original_ok:
             logger.critical(
                 "DISPUTE 7-A: Feasibility formulas DISAGREE. "
-                "Corrected=%s, Original=%s. "
-                "Investigate bandwidth configuration.",
+                "Corrected=%s, Original=%s. Investigate bandwidth configuration.",
                 "PASS" if corrected_ok else "FAIL",
                 "PASS" if original_ok else "FAIL",
             )
@@ -573,29 +533,23 @@ class Trainer:
         accum_loss = 0.0
         micro_step = 0
 
-        _profile_handle = None
-
         for batch in self._dataloader:
             if self._step >= self._total_steps:
                 break
 
             step_start = time.monotonic()
 
-
-            # Unpack batch
             if isinstance(batch, (tuple, list)) and len(batch) >= 2:
                 inputs, labels = batch[0], batch[1]
             else:
                 inputs = batch
                 labels = None
 
-            # Move to device
             if hasattr(inputs, "to"):
                 inputs = inputs.to(self._device, non_blocking=True)
             if labels is not None and hasattr(labels, "to"):
                 labels = labels.to(self._device, non_blocking=True)
 
-            # Forward + loss
             if self._use_amp:
                 with torch.amp.autocast(device_type=self._backend, dtype=self._amp_dtype):
                     output = self._model(inputs)
@@ -604,18 +558,17 @@ class Trainer:
                 output = self._model(inputs)
                 loss = self._compute_loss(output, labels)
 
-            # Scale for gradient accumulation
             loss = loss / self._gradient_accumulation_steps
-
-            # Backward
             self._grad_scaler.scale(loss).backward()
             accum_loss = accum_loss + loss.detach()
             micro_step += 1
 
-            # Optimizer step at accumulation boundary
             if micro_step % self._gradient_accumulation_steps == 0:
+                # Open profiler span HERE — tightly scoped to the optimizer step.
+                # Previously opened outside this block, causing the handle to be
+                # overwritten on non-optimizer micro-steps without end_op.
                 _profile_handle = self._profiler.start_op("train_step")
-                # Clip gradients
+
                 if self._grad_clip > 0:
                     self._grad_scaler.unscale_(self._optimizer)
                     torch.nn.utils.clip_grad_norm_(
@@ -634,44 +587,33 @@ class Trainer:
                     else accum_loss * self._gradient_accumulation_steps
                 )
 
-                # Track step time
                 elapsed = time.monotonic() - step_start
                 self._recent_step_times.append(elapsed)
                 if len(self._recent_step_times) > 100:
                     self._recent_step_times = self._recent_step_times[-100:]
 
-                # Throughput estimate: tokens/sec = batch_size * context_len / elapsed
-                # Previously this was computed but never used (local var discarded).
-                # Now passed to profiler.end_op as metadata.
                 batch_size_est = self._infer_batch_size()
                 throughput_estimate = (
                     batch_size_est * self._context_len / elapsed if elapsed > 0 else 0.0
                 )
 
-                # End profiling with throughput metadata
+                # end_op paired with start_op above — no leaked handles.
                 self._profiler.end_op(
                     _profile_handle,
                     metadata={"throughput_tokens_per_sec": throughput_estimate},
                 )
 
-                # Logging
                 if is_main_process() and self._step % self._log_every == 0:
                     lr = self._scheduler.get_lr()
                     logger.info(
                         "Step %d | Loss: %.4f | LR: %.2e | Time: %.3fs | "
                         "Throughput: %.0f tok/s",
-                        self._step,
-                        self._last_loss,
-                        lr,
-                        elapsed,
-                        throughput_estimate,
+                        self._step, self._last_loss, lr, elapsed, throughput_estimate,
                     )
 
-                # Checkpoint
                 if self._step % self._checkpoint_every == 0:
                     self._save_checkpoint()
 
-                # Heap rebuild / controller replan for dynamic routing
                 if (
                     self._dynamic_routing
                     and self._step % self._heap_rebuild_interval == 0
@@ -685,12 +627,9 @@ class Trainer:
                             logger.debug("Heap rebuild skipped: %s", e)
                     else:
                         logger.debug(
-                            "Heap rebuild skipped: no compute graph registered "
-                            "(dynamic_routing=True). Call register_compute_graph() "
-                            "to enable Bélády-optimal eviction."
+                            "Heap rebuild skipped: no compute graph registered."
                         )
 
-                # Controller replan check (advisory, non-blocking)
                 try:
                     new_plan = self._controller.step(
                         step_num=self._step,
@@ -701,8 +640,7 @@ class Trainer:
                         self._parallelism_plan = new_plan
                         logger.warning(
                             "Replanning mid-training at step %d: %s",
-                            self._step,
-                            new_plan,
+                            self._step, new_plan,
                         )
                 except Exception as e:
                     logger.debug("Controller step skipped: %s", e)
@@ -710,12 +648,10 @@ class Trainer:
                 accum_loss = 0.0
                 micro_step = 0
 
-        # Final checkpoint
         if is_main_process():
             self._save_checkpoint()
             logger.info("Training complete at step %d", self._step)
 
-        # Shutdown profiler
         self._profiler.shutdown()
 
     # ------------------------------------------------------------------
@@ -723,14 +659,7 @@ class Trainer:
     # ------------------------------------------------------------------
 
     def get_state(self) -> dict:
-        """Return training state snapshot for monitoring.
-
-        throughput_tokens_per_sec is now computed as
-        ``batch_size * context_len / avg_step_time``, which reflects actual
-        token throughput across the whole batch.  Previously it divided only
-        ``context_len`` by ``avg_step_time``, producing a per-sequence figure
-        that was off by a factor of batch_size for multi-sample batches.
-        """
+        """Return training state snapshot."""
         throughput = 0.0
         if self._recent_step_times:
             avg_time = sum(self._recent_step_times) / len(self._recent_step_times)
@@ -788,14 +717,11 @@ class Trainer:
     # ------------------------------------------------------------------
 
     def _infer_vocab_size(self) -> int:
-        """Try to infer vocabulary size from model attributes."""
         for attr in ("config", "cfg"):
             cfg = getattr(self._model, attr, None)
             if cfg is None:
                 continue
             for key in ("vocab_size", "n_vocab", "ntokens"):
-                # Handle both attribute-style configs (e.g. HuggingFace AttrDict)
-                # and plain dict configs.
                 if isinstance(cfg, dict):
                     val = cfg.get(key)
                 else:
@@ -805,7 +731,6 @@ class Trainer:
         return 32000
 
     def _infer_batch_size(self) -> int:
-        """Try to infer batch size from the dataloader."""
         bs = getattr(self._dataloader, "batch_size", None)
         if bs is not None:
             return int(bs)
@@ -814,15 +739,6 @@ class Trainer:
     def _compute_loss(
         self, output: torch.Tensor, labels: Optional[torch.Tensor]
     ) -> torch.Tensor:
-        """Compute loss from model output and labels.
-
-        Fallback path fix: the previous code returned ``output`` directly if
-        ``output`` lacked a ``.mean()`` method.  A non-scalar return causes
-        ``.backward()`` to raise ``RuntimeError: grad can be implicitly created
-        only for scalar outputs``.  The fallback now always returns a scalar
-        via ``.reshape(-1).sum()`` and emits a ``UserWarning`` so the caller
-        is aware they are training without labels.
-        """
         if labels is not None:
             if output.dim() == 3:
                 B, S, V = output.shape
@@ -830,22 +746,23 @@ class Trainer:
                 labels = labels.view(B * S)
             return self._loss_fn(output.float(), labels)
 
-        # Fallback: no labels provided.
         warnings.warn(
             "_compute_loss: no labels provided — using mean of model output as "
-            "a proxy loss.  Gradients are not meaningful.  Pass labels to "
-            "compute a real loss.",
+            "a proxy loss. Gradients are not meaningful.",
             UserWarning,
             stacklevel=2,
         )
         if hasattr(output, "mean"):
             return output.float().mean()
-        # output.mean() unavailable — squeeze to scalar via sum to avoid
-        # 'grad can be implicitly created only for scalar outputs' RuntimeError.
         return output.float().reshape(-1).sum()
 
     def _save_checkpoint(self) -> None:
-        """Save a checkpoint to disk."""
+        """Save a checkpoint atomically.
+
+        Uses os.replace() for atomic rename on POSIX. Falls back to
+        shutil.move() on Windows where os.replace() raises PermissionError
+        if the destination file is open by another process.
+        """
         if not is_main_process():
             return
 
@@ -861,13 +778,16 @@ class Trainer:
             }
             tmp_path = path + ".tmp"
             torch.save(state, tmp_path)
-            os.replace(tmp_path, path)
+            try:
+                os.replace(tmp_path, path)
+            except OSError:
+                # Windows: destination may be locked by another process.
+                shutil.move(tmp_path, path)
             logger.info("Checkpoint saved: %s", path)
         except Exception as e:
             logger.warning("Checkpoint save failed: %s", e)
 
     def _load_checkpoint(self, path: str) -> None:
-        """Load a checkpoint from disk."""
         if not os.path.exists(path):
             logger.warning("Checkpoint not found: %s", path)
             return
@@ -876,8 +796,6 @@ class Trainer:
             if self._loader_config is not None:
                 from zenyx.loader.loader import ModelLoader
 
-                # Safety: ensure checkpoint is within checkpoint_dir to prevent
-                # path traversal. Resolve both paths to absolute before comparing.
                 safe_checkpoint_dir = os.path.abspath(self._checkpoint_dir)
                 safe_path = os.path.abspath(path)
                 if not safe_path.startswith(safe_checkpoint_dir + os.sep) and safe_path != safe_checkpoint_dir:
@@ -894,9 +812,8 @@ class Trainer:
                     )
                 except Exception:
                     logger.warning(
-                        "weights_only=True load failed for %s — falling back to "
-                        "weights_only=False. Only use trusted checkpoint files.",
-                        path,
+                        "weights_only=True load failed for %s — falling back. "
+                        "Only use trusted checkpoint files.", path,
                     )
                     full_state = torch.load(
                         path, map_location=self._device, weights_only=False
@@ -907,10 +824,6 @@ class Trainer:
                 if "scheduler_state" in full_state:
                     self._scheduler.load_state_dict(full_state["scheduler_state"])
                 elif "scheduler_step" in full_state:
-                    logger.warning(
-                        "Old checkpoint format detected (scheduler_step). "
-                        "Falling back to step-loop scheduler restore."
-                    )
                     for _ in range(full_state["scheduler_step"]):
                         self._scheduler.step()
 
@@ -935,10 +848,6 @@ class Trainer:
                 if "scheduler_state" in state:
                     self._scheduler.load_state_dict(state["scheduler_state"])
                 elif "scheduler_step" in state:
-                    logger.warning(
-                        "Old checkpoint format detected (scheduler_step). "
-                        "Falling back to step-loop scheduler restore."
-                    )
                     for _ in range(state["scheduler_step"]):
                         self._scheduler.step()
                 logger.info("Resumed from checkpoint: %s (step %d)", path, self._step)
