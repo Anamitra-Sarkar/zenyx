@@ -391,10 +391,14 @@ class OverlappedAllReduce:
         stream = self._comm_stream
         if stream is not None:
             with torch.cuda.stream(stream):
-                dist.all_reduce(tensor, op=op, group=effective_group, async_op=False)
-                event = torch.cuda.Event()
-                event.record(stream)
+                work = dist.all_reduce(tensor, op=op, group=effective_group, async_op=True)
+            # Record a CUDA event on the comm stream AFTER submitting the work.
+            # The caller uses this event to synchronize (wait for completion)
+            # on a different stream without blocking the CPU.
+            event = torch.cuda.Event()
+            stream.record_event(event)
         else:
+            # No dedicated comm stream available — fall back to synchronous.
             dist.all_reduce(tensor, op=op, group=effective_group, async_op=False)
             event = torch.cuda.Event() if torch.cuda.is_available() else None
             if event is not None:

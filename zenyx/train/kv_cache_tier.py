@@ -25,8 +25,8 @@ import heapq
 import logging
 import os
 import tempfile
-import threading
 import warnings
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 __all__ = [
@@ -54,6 +54,7 @@ _KV_BYTES_PER_TOKEN_PER_LAYER: int = 8 * 128 * 2 * 2  # = 4096
 # ---------------------------------------------------------------------------
 
 
+@dataclass
 class KVTierConfig:
     """Configuration for the KV cache tier manager.
 
@@ -69,18 +70,10 @@ class KVTierConfig:
         Declared NVMe sequential read bandwidth in GB/s.
     """
 
-    def __init__(
-        self,
-        *,
-        t0_budget_bytes: int = T0_KV_BUDGET_BYTES,
-        t1_capacity_bytes: int = 64 * 1024**3,
-        t2_path: str = "/tmp/zenyx_kv_t2",
-        nvme_bandwidth_gbs: float = 7.5,
-    ) -> None:
-        self.t0_budget_bytes = t0_budget_bytes
-        self.t1_capacity_bytes = t1_capacity_bytes
-        self.t2_path = t2_path
-        self.nvme_bandwidth_gbs = nvme_bandwidth_gbs
+    t0_budget_bytes: int = field(default_factory=lambda: T0_KV_BUDGET_BYTES)
+    t1_capacity_bytes: int = field(default_factory=lambda: 64 * 1024**3)
+    t2_path: str = "/tmp/zenyx_kv_t2"
+    nvme_bandwidth_gbs: float = 7.5
 
 
 # ---------------------------------------------------------------------------
@@ -285,10 +278,6 @@ class BeladyKVCacheManager:
         # Per-block access schedule: (layer, block) → sorted list of access times
         self._block_access_times: Dict[Tuple[int, int], List[int]] = {}
 
-        # DMA simulation (for double-buffering)
-        self._dma_lock = threading.Lock()
-        self._prefetch_buffer: Dict[Tuple[int, int], bytes] = {}
-
         # Schedule built flag
         self._schedule_built = False
 
@@ -469,6 +458,14 @@ class BeladyKVCacheManager:
         device_id : int
             This device's rank.
         """
+        if not self._schedule_built:
+            raise RuntimeError(
+                "BeladyKVCacheManager.prefetch() called before "
+                "build_access_schedule(). You must call "
+                "build_access_schedule(seq_len, device_id) once before "
+                "calling prefetch(), evict(), or get_block()."
+            )
+
         if pass_type == "forward":
             block_id = (device_id - ring_step) % self.world_size
         else:
@@ -505,6 +502,12 @@ class BeladyKVCacheManager:
 
         Eviction key = next access time from the combined fwd+bwd timeline.
         """
+        if not self._schedule_built:
+            raise RuntimeError(
+                "BeladyKVCacheManager.evict() called before "
+                "build_access_schedule()."
+            )
+
         current_time = layer_idx * self.ring_degree + ring_step
         self._evict_from_t0(current_time)
 
@@ -547,6 +550,12 @@ class BeladyKVCacheManager:
         Returns the (layer_idx, block_id) tuple as a T0 pointer handle.
         Ensures the block is in T0 before returning.
         """
+        if not self._schedule_built:
+            raise RuntimeError(
+                "BeladyKVCacheManager.get_block() called before "
+                "build_access_schedule()."
+            )
+
         # Ensure block is prefetched to T0
         self.prefetch(layer_idx, ring_step, pass_type, device_id)
 
