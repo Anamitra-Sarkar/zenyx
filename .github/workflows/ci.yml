@@ -29,7 +29,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install -e ".[dev]" || pip install torch pytest
+          pip install -e ".[dev]" || pip install torch pytest pytest-timeout
+          pip install pytest-timeout
 
       - name: Run tests
         run: pytest tests/ -v --timeout=60
