@@ -7,32 +7,43 @@ Never OOM. No config files. No manual tuning.
 
 ---
 
-## Quick Start
+## Quickstart
+
+### Install
 
 ```bash
+# From source (recommended for development)
+git clone https://github.com/Anamitra-Sarkar/zenyx
+cd zenyx
+pip install -e .
+
+# Or from PyPI (when released)
 pip install zenyx
 ```
 
+### Train a minimal toy model
+
 ```python
 import torch
-import zenyx
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+from zenyx.train.trainer import Trainer
 
-model = YourModel()
-dataloader = YourDataLoader()
+# 1. Define a minimal model
+model = nn.Sequential(nn.Linear(32, 64), nn.ReLU(), nn.Linear(64, 32))
 
-# That's it. Zenyx handles everything else.
-trainer = zenyx.train(
-    model,
-    dataloader,
-    context_len=131072,    # 128K context
-    dtype="bfloat16",
-    activation_dtype="float8_e4m3",
-)
+# 2. Create a simple DataLoader
+data = torch.randn(256, 32)
+loader = DataLoader(TensorDataset(data), batch_size=16)
 
-# Inspect training state
-state = trainer.get_state()
-print(f"Step: {state['step']}, Loss: {state['loss']:.4f}")
+# 3. Train with the modern API
+trainer = Trainer(model, loader, lr=1e-3, max_steps=50)
+trainer.train()
+print(trainer.get_state())
 ```
+
+That's it. Zenyx handles hardware detection, memory management, and
+parallelism automatically.
 
 ### Hardware Compatibility
 
@@ -43,6 +54,142 @@ print(f"Step: {state['step']}, Loss: {state['loss']:.4f}")
 | TPU v5p              | Ring Pallas + Shardy        | 1M tokens            | S_min=383        |
 | Any GPU (PCIe)       | Ring FA3 (PyTorch fallback) | 128K tokens          | S_min=15,454     |
 | CPU / Apple M3       | Chunked attention           | 32K tokens           | Development only |
+
+---
+
+## Hardware Guide
+
+### Single GPU (CUDA)
+
+Zenyx auto-detects your GPU and uses it without any extra configuration.
+
+```python
+# Works out of the box — Zenyx picks up CUDA:0 automatically
+from zenyx.train.trainer import Trainer
+trainer = Trainer(model, loader, lr=1e-4, dtype="bfloat16")
+trainer.train()
+```
+
+- HBM is used as T0; DRAM as T1; NVMe as T2 for offloading.
+- Bélády-optimal eviction ensures optimal use of available VRAM.
+- FP8 E4M3 activation checkpointing is used by default for large models.
+
+### Multi-GPU (CUDA)
+
+Launch with `torchrun` or set `MASTER_ADDR`/`MASTER_PORT`/`RANK`/`WORLD_SIZE`
+environment variables (SLURM, MPI):
+
+```bash
+torchrun --nproc_per_node=8 train.py
+```
+
+```python
+# In train.py — Trainer auto-initialises distributed if env vars are set
+from zenyx.train.trainer import Trainer
+trainer = Trainer(model, loader, lr=1e-4, context_len=131072)
+trainer.train()
+```
+
+Zenyx auto-selects TP/PP/DP degrees based on model size and GPU count.
+
+### CPU-only
+
+```python
+# Works on any machine without a GPU
+from zenyx.train.trainer import Trainer
+trainer = Trainer(model, loader, lr=1e-4)
+trainer.train()
+```
+
+- Falls back to chunked attention (no FlashAttention kernel).
+- All three-tier memory management is active but T0 is system RAM.
+- Training is slower — suitable for development, debugging, and CI.
+- No OOM crashes; memory is managed transparently.
+
+### TPU / XLA (experimental)
+
+TPU support via `torch_xla` is experimental. Install the matching
+`torch_xla` package for your TPU generation, then:
+
+```python
+import torch_xla.core.xla_model as xm
+# Zenyx auto-detects XLA devices
+from zenyx.train.trainer import Trainer
+trainer = Trainer(model, loader, lr=1e-4)
+trainer.train()
+```
+
+Ring Pallas attention (Phase 9/10) is available on TPU v5e and v5p.
+See `zenyx/ops/attention/ring_pallas_tpu.py` for details.
+
+---
+
+## Never-OOM Guarantee
+
+Zenyx uses a **three-tier memory hierarchy** to guarantee your training
+never crashes with OOM:
+
+| Tier | Storage | Speed | Purpose |
+|------|---------|-------|---------|
+| T0 | HBM/VRAM | Fastest | Active tensors |
+| T1 | CPU DRAM | Fast | Evicted tensors staged here |
+| T2 | NVMe SSD | Slower | Cold data offloaded here |
+
+### How it works
+
+1. **Bélády-optimal eviction**: the allocator looks ahead in the compute
+   graph and evicts the tensor whose next use is farthest in the future.
+   This is provably optimal — no other eviction policy does better.
+
+2. **Async prefetch**: while the GPU computes on the current batch, the
+   allocator pre-stages the next batch's tensors from T2→T1→T0.
+
+3. **FP8 activation storage**: activations are stored in FP8 E4M3 format
+   (~2× memory saving) using per-layer quantisation with straight-through
+   gradient estimation.
+
+### Feasible vs throttle mode
+
+**Feasible** (OOM-free guarantee active):  
+`F_compute ≤ _PIPELINE_DEPTH × max(B₀₁, B₁₂)`
+
+where `B₀₁` is T0↔T1 bandwidth, `B₁₂` is T1↔T2 bandwidth, `F_compute`
+is the effective memory demand of compute (TFLOPS / arithmetic intensity),
+and `_PIPELINE_DEPTH` (~100) is the prefetch lookahead depth.
+
+Modern GPUs (H100, A100) with NVMe storage are typically in **feasible**
+mode.
+
+**Throttle mode** (condition not met):  
+The runtime slows compute to match available bandwidth.  Training
+continues — it never crashes.  If you see throttle mode, you can:
+
+- Reduce batch size or sequence length.
+- Add faster NVMe storage.
+- Free GPU memory by stopping other processes.
+
+---
+
+## Running Tests and CI
+
+### Local
+
+```bash
+pytest tests/ -v
+```
+
+All test files run on CPU-only machines — no GPU required.
+
+### GitHub Actions CI
+
+The workflow in `.github/workflows/ci.yml` runs on every push and pull
+request to `main`:
+
+- Triggered on: `push` and `pull_request` to `main`
+- Runner: `ubuntu-latest` with Python 3.11
+- Install: `pip install -e ".[dev]"` (fallback: `pip install torch pytest`)
+- Command: `pytest tests/ -v --timeout=60`
+- Pip cache: enabled via `actions/cache`
 
 ---
 
@@ -62,9 +209,12 @@ Three-tier memory system manages data across three storage levels:
 
 The Bélády-optimal eviction policy uses reuse distances computed from the static compute graph to evict the tensor whose next use is farthest in the future — provably optimal.
 
-**Formal feasibility condition:** `(1/B₀₁) + (1/B₁₂) ≤ (1/F_compute)`
+**Formal feasibility condition:** `F_compute ≤ _PIPELINE_DEPTH × max(B₀₁, B₁₂)`
 
-Where B₀₁ is T0↔T1 bandwidth, B₁₂ is T1↔T2 bandwidth, and F_compute is the compute rate. If this condition holds, Zenyx guarantees zero OOM. If it doesn't hold, Zenyx throttles compute to match memory bandwidth — never crashes.
+Where `B₀₁` is T0↔T1 bandwidth, `B₁₂` is T1↔T2 bandwidth, `F_compute`
+is the compute demand in bytes/sec, and `_PIPELINE_DEPTH` (~100) is the
+prefetch lookahead depth.  If this condition holds, Zenyx guarantees zero OOM.
+If it doesn't hold, Zenyx throttles compute to match memory bandwidth — never crashes.
 
 ### Hardware Agnostic
 - **NVIDIA CUDA** — cuBLAS + FlashAttention-3 + NCCL + cuFile GDS
@@ -118,8 +268,8 @@ zenyx/
 │   ├── comm/          # Topology detection, ring comm, all-reduce
 │   └── vocab/         # Distributed cross-entropy (500K+ vocab safe)
 ├── train/
-│   ├── trainer.py     # Trainer class + zenyx.train() entrypoint
-│   ├── loop.py        # Legacy train loop (Phase 2, deprecated)
+│   ├── trainer.py     # Trainer class + zenyx.train() entrypoint  ← PRIMARY API
+│   ├── loop.py        # Legacy train loop (Phase 2, deprecated — use Trainer)
 │   ├── kv_cache_tier.py  # Phase 7: Bélády-optimal KV cache tiering
 │   ├── fp8_kv.py      # Phase 8: FP8 KV quantization + STE + SwiGLU
 │   ├── ring_curriculum.py # Phase 9: Dynamic ring degree curriculum
@@ -152,6 +302,8 @@ zenyx/docs/
 
 ## Trainer API
 
+The primary training entrypoint is `zenyx.train.trainer.Trainer`:
+
 ```python
 from zenyx.train.trainer import Trainer
 
@@ -170,6 +322,9 @@ trainer = Trainer(
 )
 trainer.train()
 ```
+
+> **Deprecated:** `zenyx.train.loop` is deprecated as of v1.0 and will be removed in a future
+> release. Importing it emits a `DeprecationWarning`. Use `zenyx.train.trainer.Trainer` instead.
 
 ## Memory Budget Calculator
 

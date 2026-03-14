@@ -236,14 +236,19 @@ class CudaHAL(HALBase):
     def _alloc_t1(self, size: int) -> MemBlock:
         """Allocate pinned CPU memory.
 
+        Uses ``pin_memory=True`` when the CUDA runtime is available for
+        DMA-accelerated H2D copies; falls back to ordinary CPU memory on
+        systems without a CUDA driver (test environments, CPU-only CI).
+
         Time complexity:  O(1) amortised.
         Space complexity: O(size).
         """
+        _pin = torch.cuda.is_available()
         tensor = torch.empty(
             size // 2,
             dtype=torch.float16,
             device="cpu",
-            pin_memory=True,
+            pin_memory=_pin,
         )
         block = MemBlock(
             data=tensor,

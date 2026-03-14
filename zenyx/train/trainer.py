@@ -810,14 +810,13 @@ class Trainer:
                     full_state = torch.load(
                         path, map_location=self._device, weights_only=True
                     )
-                except Exception:
-                    logger.warning(
-                        "weights_only=True load failed for %s — falling back. "
-                        "Only use trusted checkpoint files.", path,
+                except Exception as exc:
+                    logger.error(
+                        "Checkpoint load failed for %s: %s. "
+                        "Only use trusted checkpoint files saved with weights_only=True.",
+                        path, exc,
                     )
-                    full_state = torch.load(
-                        path, map_location=self._device, weights_only=False
-                    )
+                    raise
 
                 self._optimizer.load_state_dict(full_state["optimizer_state_dict"])
                 self._step = full_state.get("step", 0)
