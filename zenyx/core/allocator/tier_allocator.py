@@ -9,6 +9,14 @@ an OOM exception — it blocks (sleeps) until eviction frees sufficient space.
 Async prefetching is driven by the compute graph: at each :meth:`step` call
 the allocator looks ahead by :attr:`prefetch_window` operations and promotes
 blocks from T1/T2 → T0 so they are resident before the kernel needs them.
+
+Fix notes
+---------
+* get_stats(): previously used getattr(self._pool, "t0_used_bytes", 0) etc.
+  MemoryPool exposes no such top-level attributes — the data lives inside
+  self._tiers[MemTier.Tx].allocated / .capacity.  All seven getattr calls
+  resolved to 0, making every AllocatorStats snapshot all-zeros.  Fixed by
+  calling self._pool.usage() which returns {MemTier: (allocated, capacity)}.
 """
 
 from __future__ import annotations
@@ -520,8 +528,15 @@ class TierAllocator:
     def get_stats(self) -> AllocatorStats:
         """Return a snapshot of allocator health metrics.
 
-        The tier usage numbers are read from the underlying
-        :class:`MemoryPool`.
+        Reads live tier usage from :meth:`MemoryPool.usage` which returns
+        ``{MemTier: (allocated, capacity)}``.
+
+        Fix: the previous implementation used
+        ``getattr(self._pool, "t0_used_bytes", 0)`` etc.  ``MemoryPool``
+        exposes no such top-level attributes — the data lives inside
+        ``self._tiers[MemTier.Tx].allocated / .capacity``.  All seven
+        ``getattr`` calls resolved to 0, making every ``AllocatorStats``
+        snapshot all-zeros.
 
         Returns:
             :class:`AllocatorStats` reflecting the current state.
@@ -530,28 +545,29 @@ class TierAllocator:
         Space: O(1)
         """
         with self._lock:
-            # Read tier capacities from pool (duck-typed — pool exposes
-            # per-tier usage via attributes or a method).
-            t0_used = getattr(self._pool, "t0_used_bytes", 0)
-            t0_total = getattr(self._pool, "t0_total_bytes", 0)
-            t1_used = getattr(self._pool, "t1_used_bytes", 0)
-            t1_total = getattr(self._pool, "t1_total_bytes", 0)
-            t2_used = getattr(self._pool, "t2_used_bytes", 0)
-            t2_total = getattr(self._pool, "t2_total_bytes", 0)
+            pool_usage = {}
+            if hasattr(self._pool, "usage"):
+                try:
+                    pool_usage = self._pool.usage()
+                except Exception:
+                    pass
+
+            t0 = pool_usage.get(MemTier.T0, (0, 0))
+            t1 = pool_usage.get(MemTier.T1, (0, 0))
+            t2 = pool_usage.get(MemTier.T2, (0, 0))
 
             return AllocatorStats(
-                t0_used_bytes=t0_used,
-                t0_total_bytes=t0_total,
-                t1_used_bytes=t1_used,
-                t1_total_bytes=t1_total,
-                t2_used_bytes=t2_used,
-                t2_total_bytes=t2_total,
+                t0_used_bytes=t0[0],
+                t0_total_bytes=t0[1],
+                t1_used_bytes=t1[0],
+                t1_total_bytes=t1[1],
+                t2_used_bytes=t2[0],
+                t2_total_bytes=t2[1],
                 eviction_count=self._eviction_count,
                 prefetch_requests=self._prefetch_requests,
                 prefetch_hits=self._prefetch_hits,
                 throttle_count=self._throttle_count,
             )
-
 
     def shutdown(self) -> None:
         """Shut down internal background resources."""
