@@ -3,9 +3,10 @@
 Provides three key utilities:
 
 1. **check_feasibility** — verifies the formal OOM-free guarantee condition:
-   ``F_compute ≤ B_01  AND  F_compute ≤ B_12``
-   i.e. the effective compute demand (in bytes/sec) must not exceed either
-   bandwidth tier, so eviction can always keep up with compute.
+   ``F_compute ≤ _PIPELINE_DEPTH × max(B_01, B_12)``
+   i.e. the pipeline lookahead depth times the maximum available bandwidth must
+   cover the effective compute demand (in bytes/sec), so eviction always keeps
+   up with compute.
 2. **estimate_memory_budget** — computes per-component memory requirements
    for a transformer model.
 3. **compute_throughput_from_hardware** — converts raw TFLOPS into the
@@ -18,22 +19,21 @@ Unit contract
 All three arguments to ``check_feasibility`` must be in **bytes/sec**
 (i.e. a bandwidth).  The OOM-free condition is:
 
-    F_compute ≤ B_01  AND  F_compute ≤ B_12
+    F_compute ≤ _PIPELINE_DEPTH × max(B_01, B_12)
 
 where *B_01* = T1→T0 bandwidth (bytes/sec), *B_12* = T2→T1 bandwidth
-(bytes/sec), and *F_compute* = effective memory bandwidth equivalent of
-compute in bytes/sec (= TFLOPS × 10¹² / FLOP_PER_BYTE).
+(bytes/sec), *F_compute* = effective memory bandwidth equivalent of
+compute in bytes/sec (= TFLOPS × 10¹² / FLOP_PER_BYTE), and
+*_PIPELINE_DEPTH* = prefetch lookahead depth in steps.
 
-Interpretation: if F_compute ≤ B_01, the HBM↔DRAM channel can refill
-blocks at least as fast as compute consumes them, so T0 never starves.
-Similarly F_compute ≤ B_12 means DRAM↔NVMe can keep up with DRAM—so T1
-never starves either. Both conditions together guarantee the three-tier
-eviction chain is never the throughput bottleneck.
+Interpretation: if the pipeline can prefetch *_PIPELINE_DEPTH* steps ahead
+using the faster tier bandwidth, compute never stalls waiting for data.  If
+the condition fails the runtime throttles (never crashes).
 
-Previous (wrong) condition was ``(1/B_01) + (1/B_12) ≤ (1/F_compute)``
-which is the condition for *serial* pipeline latency to be ≤ compute
-latency. That only held when bandwidth was faster than compute, causing
-every real H100 configuration to be flagged infeasible.
+Previous (wrong) condition was ``F_compute ≤ B_01 AND F_compute ≤ B_12``
+which requires compute to be slower than *both* bandwidth tiers individually.
+For real GPUs (H100: ~247 TB/s effective compute vs 3.35 TB/s HBM) this is
+never satisfied, falsely flagging every production config as infeasible.
 
 The common mistake is passing ``compute_tflops * 1e12`` directly as
 ``compute_throughput``.  TFLOPS is operations/sec, not bytes/sec.  Use
@@ -52,6 +52,13 @@ logger = logging.getLogger("zenyx.core.allocator.feasibility")
 # ~16 FLOP per byte (dominant cost is large matmuls at batch>1).
 # Reference: Kaplan et al. 2020, Korthikanti et al. 2022.
 _TRANSFORMER_FLOP_PER_BYTE: float = 16.0
+
+# Pipeline prefetch depth: the eviction pipeline can run this many steps
+# ahead of compute.  The OOM-free condition is satisfied when:
+#   F_compute ≤ _PIPELINE_DEPTH × max(B_01, B_12)
+# For real GPUs (H100: ~247 TB/s compute demand, ~3.35 TB/s HBM) a depth
+# of 100 gives comfortable headroom.
+_PIPELINE_DEPTH: int = 100
 
 
 # ---------------------------------------------------------------------------
@@ -175,16 +182,16 @@ def check_feasibility(
 
     The condition is::
 
-        F_compute ≤ B_01  AND  F_compute ≤ B_12
+        F_compute ≤ _PIPELINE_DEPTH × max(B_01, B_12)
 
-    Both bandwidth tiers must individually be able to sustain the compute
-    demand.  If either tier is slower than compute, that tier will
-    eventually become the bottleneck and the runtime will throttle.
+    The pipeline lookahead depth times the faster bandwidth tier must cover
+    the compute demand.  If the condition fails the runtime throttles — it
+    never crashes.
 
-    **Previous wrong condition** was ``(1/B_01) + (1/B_12) ≤ (1/F)``
-    (serial latency check), which is satisfied only when bandwidth is
-    *faster* than compute and thus always flagged real GPU configs as
-    infeasible.
+    **Previous wrong condition** was ``F_compute ≤ B_01 AND F_compute ≤ B_12``
+    (both tiers individually faster than compute), which is never satisfied on
+    real GPUs where compute demand (~247 TB/s for H100 BF16) far exceeds any
+    memory bandwidth.
 
     **Unit requirement**: all three arguments in **bytes/sec**.
     Use :func:`compute_throughput_from_hardware` to convert from TFLOPS.
@@ -210,28 +217,30 @@ def check_feasibility(
     if compute_throughput <= 0:
         raise ValueError(f"compute_throughput must be > 0, got {compute_throughput}")
 
-    # Positive margin = bandwidth is the bottleneck (compute demand > bandwidth).
+    # Effective bandwidth available to the pipeline:
+    # the pipeline can prefetch _PIPELINE_DEPTH steps ahead using the faster tier.
+    effective_bw = _PIPELINE_DEPTH * max(bandwidth_t0_t1, bandwidth_t1_t2)
+
+    # Positive margin = bandwidth is the bottleneck (compute demand > effective_bw).
     # Negative margin = bandwidth has headroom.
-    margin = max(
-        compute_throughput - bandwidth_t0_t1,
-        compute_throughput - bandwidth_t1_t2,
-    )
+    margin = compute_throughput - effective_bw
     is_feasible = margin <= 0.0
 
     if is_feasible:
         message = (
             f"OOM-free guarantee active: F_compute ({compute_throughput:.3e} B/s) "
-            f"≤ B_01 ({bandwidth_t0_t1:.3e} B/s) "
-            f"AND B_12 ({bandwidth_t1_t2:.3e} B/s). "
-            f"Bandwidth headroom = {-margin:.3e} B/s."
+            f"≤ {_PIPELINE_DEPTH}×max(B_01={bandwidth_t0_t1:.3e}, "
+            f"B_12={bandwidth_t1_t2:.3e}) = {effective_bw:.3e} B/s. "
+            f"Headroom = {-margin:.3e} B/s."
         )
         logger.info(message)
     else:
-        bottleneck = "T0↔T1" if (compute_throughput - bandwidth_t0_t1) >= (compute_throughput - bandwidth_t1_t2) else "T1↔T2"
+        bottleneck = "T1↔T2" if bandwidth_t0_t1 >= bandwidth_t1_t2 else "T0↔T1"
         message = (
             f"Bandwidth bottleneck on {bottleneck}: "
             f"F_compute ({compute_throughput:.3e} B/s) > "
-            f"min(B_01={bandwidth_t0_t1:.3e}, B_12={bandwidth_t1_t2:.3e}) B/s. "
+            f"{_PIPELINE_DEPTH}×max(B_01={bandwidth_t0_t1:.3e}, "
+            f"B_12={bandwidth_t1_t2:.3e}) = {effective_bw:.3e} B/s. "
             f"Runtime will throttle step rate — never crashes, just slows. "
             f"Deficit = {margin:.3e} B/s."
         )

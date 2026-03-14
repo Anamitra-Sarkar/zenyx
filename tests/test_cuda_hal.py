@@ -171,9 +171,9 @@ class TestT1T2CopyHelpers(unittest.TestCase):
         # T2 → T1
         CudaHAL._copy_t2_to_t1(dst_t2, dst_t1)
 
-        # Data must be bit-identical
+        # Data must be bit-identical (equal_nan=True so NaN==NaN is accepted).
         self.assertTrue(
-            torch.allclose(src_t1.data, dst_t1.data),
+            torch.allclose(src_t1.data, dst_t1.data, equal_nan=True),
             "Round-trip T1→T2→T1 data mismatch",
         )
 

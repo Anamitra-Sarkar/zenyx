@@ -210,7 +210,7 @@ class AsyncProfiler:
 
         return handle
 
-    def end_op(self, handle: ProfileHandle) -> None:
+    def end_op(self, handle: ProfileHandle, *, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Record the end of an operation and enqueue for aggregation.
 
         Time: O(1).  Space: O(1).
@@ -219,9 +219,16 @@ class AsyncProfiler:
         ----------
         handle : ProfileHandle
             Handle returned by :meth:`start_op`.
+        metadata : dict, optional
+            Arbitrary key/value annotations attached to this measurement
+            (e.g. ``{"throughput_tokens_per_sec": 12345}``).  Currently
+            stored on the handle for future retrieval; ignored if *None*.
         """
         if not self._enabled:
             return
+
+        if metadata is not None:
+            handle.metadata = metadata
 
         if self._has_cuda:
             import torch

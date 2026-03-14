@@ -50,6 +50,13 @@ from zenyx.train.checkpoint import AsyncCheckpointer
 from zenyx.train.mixed_prec import FP8ActivationStorage
 from zenyx.train.pipeline import BraidedPipeline
 
+warnings.warn(
+    "zenyx.train.loop is deprecated and will be removed in v1.0. "
+    "Use zenyx.train.trainer.Trainer instead.",
+    DeprecationWarning,
+    stacklevel=2,
+)
+
 __all__ = [
     "wrap",
 ]
@@ -162,9 +169,10 @@ def _plan_parallelism(
 
 
 def _check_feasibility(hw: Dict[str, Any], profile: Dict[str, Any]) -> bool:
-    """Check OOM-free feasibility condition.
+    """Check OOM-free feasibility using the real feasibility checker.
 
-    (1/B_01) + (1/B_12) ≤ (1/F_compute)
+    Delegates to :func:`zenyx.core.allocator.feasibility.check_feasibility`
+    with hardware bandwidth values from *hw*.
 
     Returns *True* if the hard guarantee holds, *False* if throttling is
     needed (but we **never crash**).
@@ -173,18 +181,28 @@ def _check_feasibility(hw: Dict[str, Any], profile: Dict[str, Any]) -> bool:
     ----------
     Time *O(1)*.
     """
-    hbm = hw.get("hbm_bytes", 0)
-    needed = profile["param_bytes"] + profile["est_activation_bytes"]
-    if hbm > 0 and needed > hbm:
+    from zenyx.core.allocator.feasibility import (
+        check_feasibility,
+        compute_throughput_from_hardware,
+    )
+
+    bandwidth_t0_t1 = hw.get("hbm_bytes", 1) or 1  # bytes/sec (fallback: 1 → infeasible)
+    bandwidth_t1_t2 = hw.get("nvme_bw", 7.5e9)
+    compute_tflops = hw.get("compute_tflops", 312.0)
+    compute_throughput = compute_throughput_from_hardware(compute_tflops)
+
+    result = check_feasibility(
+        bandwidth_t0_t1=bandwidth_t0_t1,
+        bandwidth_t1_t2=bandwidth_t1_t2,
+        compute_throughput=compute_throughput,
+    )
+
+    if not result.is_feasible:
         logger.warning(
-            "Memory budget exceeds single-device HBM: need %.2f GB, have %.2f GB. "
-            "Zenyx will use multi-tier offloading (T0→T1→T2). Training will be "
-            "throttled but will NOT OOM.",
-            needed / (1024**3),
-            hbm / (1024**3),
+            "Feasibility check FAILED — throttle mode active (no crash). %s",
+            result.message,
         )
-        return False
-    return True
+    return result.is_feasible
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +211,7 @@ def _check_feasibility(hw: Dict[str, Any], profile: Dict[str, Any]) -> bool:
 
 
 @contextmanager
- def _oom_guard_once(label: str, attempt: int) -> Iterator[None]:
+def _oom_guard_once(label: str, attempt: int) -> Iterator[None]:
     """Single-attempt OOM guard.  Yields once; catches OutOfMemoryError.
 
     Raises _OOMRetry if an OOM is caught so the caller can retry.

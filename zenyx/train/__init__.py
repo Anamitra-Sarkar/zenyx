@@ -9,7 +9,7 @@ from zenyx.train.mixed_prec import (
     fp8_checkpoint,
 )
 from zenyx.train.pipeline import BraidedPipeline, ScheduleStep, StepAction
-from zenyx.train.trainer import Trainer, train
+from zenyx.train.trainer import Trainer, train as _legacy_train
 from zenyx.train.lr_schedule import CosineWithWarmup
 from zenyx.train.grad_scaler import ZenyxGradScaler
 from zenyx.train.distributed_setup import (
@@ -62,7 +62,7 @@ __all__ = [
     "AsyncCheckpointer",
     # trainer (Phase 4)
     "Trainer",
-    "train",
+    "_legacy_train",
     # lr_schedule
     "CosineWithWarmup",
     # grad_scaler
@@ -111,8 +111,9 @@ class legacy:  # noqa: N801
           Frame 1: legacy.wrap() body            (this frame)
           Frame 2: user code                     ← warning correctly points here
 
-        The inner loop.wrap() DeprecationWarning is suppressed so callers
-        receive exactly one warning, attributed to their own call site.
+        The inner loop.py module-level and loop.wrap() DeprecationWarnings are
+        suppressed inside the with-block so callers receive exactly one warning,
+        attributed to their own call site.
         """
         import warnings as _warnings
         _warnings.warn(
@@ -121,7 +122,7 @@ class legacy:  # noqa: N801
             DeprecationWarning,
             stacklevel=2,
         )
-        from zenyx.train.loop import wrap as _legacy_wrap
         with _warnings.catch_warnings():
             _warnings.simplefilter("ignore", DeprecationWarning)
+            from zenyx.train.loop import wrap as _legacy_wrap
             return _legacy_wrap(*args, **kwargs)
