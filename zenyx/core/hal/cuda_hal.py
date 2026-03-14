@@ -8,6 +8,8 @@ Memory model:
 Copy strategy:
   * T0 ↔ T1 — CUDA streams (``tensor.copy_(..., non_blocking=True)``).
   * T2 ↔ T1 — ``concurrent.futures.ThreadPoolExecutor`` for async NVMe I/O.
+  * T0 ↔ T2 — Staged through an auto-allocated T1 intermediary (no direct
+    path; NVMe cannot DMA directly to/from HBM without GPUDirect Storage).
 
 This module **never** raises ``torch.cuda.OutOfMemoryError``.
 """
@@ -146,7 +148,9 @@ class CudaHAL(HALBase):
         Allocation is aligned to 2 MiB boundaries for NVMe / PCIe compat.
 
         Never raises OOM — if T0 is full, the caller should evict first
-        (handled at the MemoryPool level).
+        (handled at the MemoryPool level).  If the T0 allocator returns a
+        zero-size sentinel (CUDA OOM was caught internally), a ``ValueError``
+        is raised so the caller knows to evict before retrying.
 
         Args:
             size_bytes: Requested size.
@@ -155,13 +159,26 @@ class CudaHAL(HALBase):
         Returns:
             A :class:`MemBlock` handle.
 
+        Raises:
+            ValueError: If T0 allocation returns the zero-size OOM sentinel.
+
         Time complexity:  O(1) amortised (pool sub-allocation).
         Space complexity: O(aligned_size).
         """
         aligned = _align_up(size_bytes)
 
         if tier == MemTier.T0:
-            return self._alloc_t0(aligned)
+            block = self._alloc_t0(aligned)
+            # Guard: _alloc_t0 returns a zero-size sentinel on CUDA OOM.
+            # Propagate as ValueError so the MemoryPool eviction loop can
+            # catch it, evict the LRU block, and retry — never silently
+            # proceeding with a corrupt zero-size block.
+            if block.size_bytes == 0:
+                raise ValueError(
+                    f"CudaHAL: T0 allocation of {_human_bytes(aligned)} returned "
+                    "zero-size sentinel (CUDA OOM). Evict blocks from T0 and retry."
+                )
+            return block
         elif tier == MemTier.T1:
             return self._alloc_t1(aligned)
         else:
@@ -169,6 +186,10 @@ class CudaHAL(HALBase):
 
     def _alloc_t0(self, size: int) -> MemBlock:
         """Allocate from CUDA device memory.
+
+        Returns a zero-size sentinel block on CUDA OOM rather than
+        propagating the exception.  Callers **must** check ``block.size_bytes
+        == 0`` and handle accordingly (see :meth:`alloc`).
 
         Time complexity:  O(1) amortised.
         Space complexity: O(size).
@@ -182,12 +203,22 @@ class CudaHAL(HALBase):
             )
         except torch.cuda.OutOfMemoryError:
             # Never propagate — log and return a zero-size sentinel.
+            # alloc() will convert this to a ValueError so the eviction
+            # loop in MemoryPool can catch it cleanly.
             logger.error(
-                "CUDA OOM while allocating %s on T0 — caller must evict",
+                "CUDA OOM while allocating %s on T0 — returning sentinel; caller must evict",
                 _human_bytes(size),
             )
             tensor = torch.empty(0, dtype=torch.float16, device=self._device)
-            size = 0
+            # Sentinel: size_bytes=0 signals OOM to alloc()
+            return MemBlock(
+                data=tensor,
+                tier=MemTier.T0,
+                size_bytes=0,
+                address=0,
+                dtype="float16",
+                shape=(0,),
+            )
 
         block = MemBlock(
             data=tensor,
@@ -233,7 +264,10 @@ class CudaHAL(HALBase):
         Time complexity:  O(1) (fallocate / ftruncate).
         Space complexity: O(size) on disk.
         """
-        path = os.path.join(self._t2_dir, f"t2_{os.getpid()}_{threading.get_ident()}_{size}.mmap")
+        path = os.path.join(
+            self._t2_dir,
+            f"t2_{os.getpid()}_{threading.get_ident()}_{size}.mmap",
+        )
         fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC)
         try:
             os.ftruncate(fd, size)
@@ -307,10 +341,14 @@ class CudaHAL(HALBase):
     ) -> None:
         """Asynchronously copy data from *src* to *dst*, potentially across tiers.
 
-        * **T0 ↔ T1**: Uses CUDA streams for non-blocking DMA.
-        * **T2 ↔ T1**: Uses thread-pool executor for async NVMe I/O.
-        * **T0 ↔ T2**: Stages through T1 conceptually — caller should
-          allocate an intermediate T1 block for best performance.
+        Supported paths
+        ---------------
+        * **T0 ↔ T1** — CUDA streams (non-blocking DMA via PCIe/NVLink).
+        * **T2 ↔ T1** — Thread-pool executor for async NVMe I/O.
+        * **T0 ↔ T2** — Staged through an auto-allocated T1 intermediary.
+          NVMe cannot DMA directly to/from device HBM without GPUDirect
+          Storage (GDS), and GDS availability cannot be guaranteed at
+          runtime. Staging is safe, correct, and avoids device stalls.
 
         Args:
             src:    Source block.
@@ -318,7 +356,8 @@ class CudaHAL(HALBase):
             stream: Optional ``torch.cuda.Stream``.
 
         Time complexity:  O(size / bandwidth).
-        Space complexity: O(1) (in-place copy).
+        Space complexity: O(1) for T0↔T1 and T1↔T2; O(size) for T0↔T2
+                          staging (temporary T1 buffer is freed after copy).
         """
         if dst.size_bytes < src.size_bytes:
             logger.warning(
@@ -334,7 +373,6 @@ class CudaHAL(HALBase):
                 nbytes = min(src.size_bytes, dst.size_bytes)
                 src_t = src.data
                 dst_t = dst.data
-                # Ensure tensors have compatible views
                 numel = nbytes // 2  # FP16 = 2 bytes
                 dst_t[:numel].copy_(src_t[:numel], non_blocking=True)
             return
@@ -349,10 +387,43 @@ class CudaHAL(HALBase):
             self._io_pool.submit(self._copy_t1_to_t2, src, dst)
             return
 
-        # ---- T0 ↔ T2 (not directly supported — log error) ----------------
+        # ---- T0 → T2 (stage: T0 → T1 intermediary → T2) -----------------
+        if src.tier == MemTier.T0 and dst.tier == MemTier.T2:
+            nbytes = min(src.size_bytes, dst.size_bytes)
+            t1_intermediate = self._alloc_t1(nbytes)
+            try:
+                # Step 1: T0 → T1 via CUDA stream (synchronous w.r.t. host)
+                s = stream or self._default_stream
+                with torch.cuda.stream(s):
+                    numel = nbytes // 2
+                    t1_intermediate.data[:numel].copy_(src.data[:numel], non_blocking=False)
+                torch.cuda.synchronize()
+                # Step 2: T1 → T2 via thread-pool async NVMe write
+                future = self._io_pool.submit(self._copy_t1_to_t2, t1_intermediate, dst)
+                future.result()  # wait for NVMe write to complete
+            finally:
+                self.free(t1_intermediate)
+            return
+
+        # ---- T2 → T0 (stage: T2 → T1 intermediary → T0) -----------------
+        if src.tier == MemTier.T2 and dst.tier == MemTier.T0:
+            nbytes = min(src.size_bytes, dst.size_bytes)
+            t1_intermediate = self._alloc_t1(nbytes)
+            try:
+                # Step 1: T2 → T1 via thread-pool async NVMe read
+                future = self._io_pool.submit(self._copy_t2_to_t1, src, t1_intermediate)
+                future.result()  # wait for NVMe read to complete
+                # Step 2: T1 → T0 via CUDA stream
+                s = stream or self._default_stream
+                with torch.cuda.stream(s):
+                    numel = nbytes // 2
+                    dst.data[:numel].copy_(t1_intermediate.data[:numel], non_blocking=True)
+            finally:
+                self.free(t1_intermediate)
+            return
+
         logger.error(
-            "Direct T0 ↔ T2 copy not supported — stage through T1. "
-            "src.tier=%s, dst.tier=%s",
+            "copy: unsupported tier pair src=%s dst=%s",
             src.tier,
             dst.tier,
         )
@@ -367,7 +438,6 @@ class CudaHAL(HALBase):
         mm: mmap.mmap = src.data
         mm.seek(0)
         raw = mm.read(min(src.size_bytes, dst.size_bytes))
-        # Copy bytes into the pinned tensor's storage
         buf = torch.frombuffer(bytearray(raw), dtype=torch.float16)
         numel = min(buf.numel(), dst.data.numel())
         dst.data[:numel].copy_(buf[:numel])
@@ -381,7 +451,6 @@ class CudaHAL(HALBase):
         """
         mm: mmap.mmap = dst.data
         nbytes = min(src.size_bytes, dst.size_bytes)
-        # Get raw bytes from the tensor storage
         raw = bytes(src.data.numpy().view("uint8")[:nbytes])
         mm.seek(0)
         mm.write(raw)
