@@ -89,6 +89,16 @@ _KNOWN_GPUS: dict[str, tuple[float, InterconnectType]] = {
     "3090": (71.0,  "pcie"),
 }
 
+_KNOWN_ROCM_GPUS: dict[str, tuple[float, InterconnectType]] = {
+    "MI300X": (1307.0, "infiniband"),
+    "MI300A": (977.0, "infiniband"),
+    "MI250X": (383.0, "infiniband"),
+    "MI250": (362.0, "pcie"),
+    "MI210": (181.0, "pcie"),
+    "RX 7900": (61.0, "pcie"),
+}
+
+
 
 # ---------------------------------------------------------------------------
 # Internal detection helpers
@@ -179,14 +189,24 @@ def _build_rocm_info(
     logger.warning(
         "ROCm detected: expect 37-45%% MFU vs H100's 45-55%% due to kernel gap"
     )
+    tflops = 50.0
+    interconnect: InterconnectType = "pcie"
+    for key, (known_tflops, known_interconnect) in _KNOWN_ROCM_GPUS.items():
+        if key in device_name:
+            tflops = known_tflops
+            interconnect = known_interconnect
+            break
+
+    bw_t0_t1 = 64.0 * (1024 ** 3) if interconnect == "infiniband" else 32.0 * (1024 ** 3)
+
     return HardwareInfo(
         backend="rocm",
         device_count=device_count,
         per_device_memory_bytes=per_device_mem,
-        interconnect="pcie",
-        bandwidth_t0_t1=32.0 * (1024 ** 3),
+        interconnect=interconnect,
+        bandwidth_t0_t1=bw_t0_t1,
         bandwidth_t1_t2=7.0 * (1024 ** 3),
-        compute_tflops=50.0,  # conservative — MI300X ≈ 1307 FP16, but MFU is lower
+        compute_tflops=tflops,
         device_name=device_name,
     )
 
@@ -223,7 +243,7 @@ def _detect_xla() -> HardwareInfo | None:
         return None
 
     devices = jax.devices()
-    tpu_devices = [d for d in devices if d.platform == "tpu"]
+    tpu_devices = [d for d in devices if d.platform.lower() == "tpu"]
     if not tpu_devices:
         return None
 
@@ -339,6 +359,30 @@ def _get_system_memory() -> int:
     except (AttributeError, ValueError):
         # Fallback: 16 GiB default
         return 16 * (1024 ** 3)
+
+
+def build_hal_for_hardware(hw_info: HardwareInfo):
+    """Instantiate the appropriate HAL backend for *hw_info*.
+
+    Time complexity: O(1).
+    Space complexity: O(1).
+    """
+    if hw_info.backend == "cuda":
+        from zenyx.core.hal.cuda_hal import CudaHAL
+
+        return CudaHAL(device=0)
+    if hw_info.backend == "rocm":
+        from zenyx.core.hal.rocm_hal import RocmHAL
+
+        return RocmHAL(device_index=0)
+    if hw_info.backend == "xla":
+        from zenyx.core.hal.xla_hal import XlaHAL
+
+        return XlaHAL(device_index=0)
+
+    from zenyx.core.hal.cpu_hal import CpuHAL
+
+    return CpuHAL(t0_capacity_bytes=hw_info.per_device_memory_bytes)
 
 
 # ---------------------------------------------------------------------------

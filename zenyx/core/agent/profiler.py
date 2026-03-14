@@ -15,7 +15,6 @@ Complexity
 from __future__ import annotations
 
 import logging
-import math
 import threading
 import time
 from collections import defaultdict
@@ -391,4 +390,7 @@ class AsyncProfiler:
         )
 
     def __del__(self) -> None:
-        self.shutdown()
+        try:
+            self.shutdown()
+        except Exception:
+            pass

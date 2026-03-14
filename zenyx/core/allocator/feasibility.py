@@ -30,8 +30,9 @@ class FeasibilityResult:
 
     Attributes:
         is_feasible:        ``True`` if the bandwidth condition holds.
-        margin:             Signed margin — positive = headroom, negative = deficit.
-                            Computed as ``(1/F_compute) - ((1/B_01) + (1/B_12))``.
+        margin:             Signed margin — positive = bandwidth bottleneck (deficit),
+                            negative = bandwidth headroom.
+                            Computed as ``((1/B_01) + (1/B_12)) - (1/F_compute)``.
         bandwidth_t0_t1:    T0 ↔ T1 bandwidth in bytes/sec.
         bandwidth_t1_t2:    T1 ↔ T2 bandwidth in bytes/sec.
         compute_throughput: Compute throughput in bytes/sec equivalent.
@@ -143,18 +144,23 @@ def check_feasibility(
 
     inv_bw = (1.0 / bandwidth_t0_t1) + (1.0 / bandwidth_t1_t2)
     inv_compute = 1.0 / compute_throughput
-    margin = inv_compute - inv_bw  # positive = feasible
+    margin = inv_bw - inv_compute  # positive = BW bottleneck (deficit), negative = headroom
 
-    is_feasible = margin >= 0.0
+    is_feasible = margin <= 0.0
 
     if is_feasible:
-        message = "OOM-free guarantee: bandwidth sufficient"
+        message = (
+            f"OOM-free guarantee active: bandwidth latency "
+            f"({inv_bw:.3e}s) ≤ compute latency ({inv_compute:.3e}s). "
+            f"Headroom = {-margin:.3e}s."
+        )
         logger.info(message)
     else:
         message = (
-            f"Will throttle step rate to match slowest bandwidth — never crashes, just slows. "
-            f"(1/B_01)+(1/B_12) = {inv_bw:.6e} s > (1/F_compute) = {inv_compute:.6e} s, "
-            f"deficit = {abs(margin):.6e} s"
+            f"Bandwidth bottleneck: (1/B_01)+(1/B_12)={inv_bw:.3e}s > "
+            f"(1/F_compute)={inv_compute:.3e}s. "
+            f"Runtime will throttle step rate — never crashes, just slows. "
+            f"Deficit = {margin:.3e}s."
         )
         logger.warning(message)
 
