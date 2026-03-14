@@ -13,9 +13,9 @@ blocks from T1/T2 → T0 so they are resident before the kernel needs them.
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import threading
-import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -210,9 +210,13 @@ class TierAllocator:
 
         # Thread safety
         self._lock = threading.RLock()
+        self._space_available = threading.Condition(self._lock)
 
-        # Prefetch thread coordination
-        self._prefetch_thread: Optional[threading.Thread] = None
+        # Prefetch coordination
+        self._prefetch_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix="zenyx-prefetch",
+        )
 
         logger.info(
             "TierAllocator created: block_size=%d MiB, hardware=%s",
@@ -301,12 +305,8 @@ class TierAllocator:
                 )
                 # Still do not raise — keep trying.
 
-            # Release lock while sleeping so other threads can free memory.
-            self._lock.release()
-            try:
-                time.sleep(_THROTTLE_POLL_INTERVAL)
-            finally:
-                self._lock.acquire()
+            # Wait while letting other threads free/evict memory.
+            self._space_available.wait(timeout=_THROTTLE_POLL_INTERVAL)
 
     def _try_evict(self, needed_tier: MemTier) -> bool:
         """Evict one block to make room in *needed_tier*.
@@ -397,6 +397,7 @@ class TierAllocator:
             self._heap.remove_block(bid)
             try:
                 self._pool.free(block)
+                self._space_available.notify_all()
             except Exception:
                 logger.debug("Pool free for block %d failed", bid, exc_info=True)
             logger.debug("Freed block %d", bid)
@@ -510,11 +511,7 @@ class TierAllocator:
                         "Prefetch of block %d failed", bid, exc_info=True
                     )
 
-        thread = threading.Thread(
-            target=_prefetch_worker, name="zenyx-prefetch", daemon=True
-        )
-        thread.start()
-        self._prefetch_thread = thread
+        self._prefetch_executor.submit(_prefetch_worker)
 
     # ------------------------------------------------------------------
     # Statistics
@@ -555,9 +552,20 @@ class TierAllocator:
                 throttle_count=self._throttle_count,
             )
 
+
+    def shutdown(self) -> None:
+        """Shut down internal background resources."""
+        self._prefetch_executor.shutdown(wait=False)
+
     # ------------------------------------------------------------------
     # Dunder
     # ------------------------------------------------------------------
+
+    def __del__(self) -> None:
+        try:
+            self.shutdown()
+        except Exception:
+            pass
 
     def __repr__(self) -> str:
         with self._lock:

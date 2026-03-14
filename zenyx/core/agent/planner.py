@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Optional
 
 from zenyx.core.hal.detector import HardwareInfo
@@ -276,8 +276,11 @@ class ParallelismPlanner:
             comm_ratio = total_comm_ms / (total_compute_ms + total_comm_ms)
             if comm_ratio > 0.3 and new_plan.tp_degree > 1:
                 # Communication-bound: reduce TP, increase DP
-                new_plan.tp_degree = max(1, new_plan.tp_degree // 2)
-                new_plan.dp_degree = new_plan.dp_degree * 2
+                new_plan = replace(
+                    new_plan,
+                    tp_degree=max(1, new_plan.tp_degree // 2),
+                    dp_degree=new_plan.dp_degree * 2,
+                )
                 logger.info(
                     "Replan: comm overhead %.1f%% — reducing TP to %d, increasing DP to %d",
                     comm_ratio * 100,
@@ -292,8 +295,11 @@ class ParallelismPlanner:
                     self._hw.device_count,
                 )
                 if max_tp > new_plan.tp_degree:
-                    new_plan.dp_degree = max(1, new_plan.dp_degree // 2)
-                    new_plan.tp_degree = max_tp
+                    new_plan = replace(
+                        new_plan,
+                        dp_degree=max(1, new_plan.dp_degree // 2),
+                        tp_degree=max_tp,
+                    )
                     logger.info(
                         "Replan: compute-bound (comm %.1f%%) — increasing TP to %d",
                         comm_ratio * 100,
@@ -331,7 +337,8 @@ class ParallelismPlanner:
         d_model = int(math.sqrt(model_params / 12))
         n_layers = max(1, int(model_params / (12 * d_model * d_model)))
         n_kv_heads = max(1, d_model // 128)  # GQA heuristic
-        d_head = d_model // max(1, n_kv_heads * 8)  # Assume n_heads = 8 × n_kv_heads
+        n_heads_estimate = max(1, d_model // 64)
+        d_head = d_model // n_heads_estimate
 
         kv_bytes = (
             2  # K + V

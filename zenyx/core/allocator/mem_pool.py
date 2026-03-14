@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from zenyx.core.hal.base import HALBase, MemBlock, MemTier, _human_bytes
-from zenyx.core.hal.detector import HardwareInfo
+from zenyx.core.hal.detector import HardwareInfo, build_hal_for_hardware
 from zenyx.core.allocator.feasibility import check_feasibility
 
 try:
@@ -112,7 +112,6 @@ class MemoryPool:
       * **Never** raises OOM.
 
     Args:
-        hal:              Concrete HAL backend.
         hw_info:          Hardware description from :func:`detect_hardware`.
         t0_reserve_frac:  Fraction of per-device memory to reserve as T0 (default 0.9).
         t1_capacity:      T1 pool size in bytes (default 8 GiB).
@@ -127,16 +126,18 @@ class MemoryPool:
 
     def __init__(
         self,
-        hal: HALBase,
         hw_info: HardwareInfo,
+        block_size_mb: int = 4,
         t0_reserve_frac: float = 0.90,
         t1_capacity: int = 8 * (1024 ** 3),
         t2_capacity: int = 64 * (1024 ** 3),
         compute_throughput: Optional[float] = None,
     ) -> None:
-        self._hal = hal
+        self._hal: HALBase = build_hal_for_hardware(hw_info)
         self._hw_info = hw_info
-        self._lock = threading.Lock()
+        self._block_size_bytes = _clamp_block_size(block_size_mb * (1 << 20))
+        self._lock = threading.RLock()
+        self._evict_depth: int = 0
         self._throttle_event = threading.Event()
         self._throttle_event.set()  # not throttling initially
 
@@ -325,63 +326,75 @@ class MemoryPool:
         Time complexity:  O(E) where E = number of blocks evicted.
         Space complexity: O(1) per eviction.
         """
-        state = self._tiers[tier]
-        target_tier = MemTier(tier.value + 1) if tier.value < 2 else None
+        self._evict_depth += 1
+        try:
+            state = self._tiers[tier]
+            target_tier = MemTier(tier.value + 1) if tier.value < 2 else None
 
-        if target_tier is None:
-            return False
+            if target_tier is None:
+                return False
 
-        target_state = self._tiers[target_tier]
+            target_state = self._tiers[target_tier]
 
-        # PHASE 1: Under the lock — claim blocks, update bookkeeping,
-        # allocate destination buffers.
-        blocks_to_copy: List[tuple[MemBlock, MemBlock]] = []
+            # PHASE 1: Under the lock — claim blocks, update bookkeeping,
+            # allocate destination buffers.
+            blocks_to_copy: List[tuple[MemBlock, MemBlock]] = []
 
-        while state.free < needed and state.blocks:
-            # Pop the oldest (LRU) block
-            oldest_id, oldest_block = next(iter(state.blocks.items()))
+            while state.free < needed and state.blocks:
+                # Pop the oldest (LRU) block
+                oldest_id, oldest_block = next(iter(state.blocks.items()))
 
-            # Check target tier has room
-            if target_state.free < oldest_block.size_bytes:
-                # Can't evict further — target tier is also full
-                # Try evicting from target tier recursively
-                if target_tier != MemTier.T2:
-                    self._evict_until(target_tier, oldest_block.size_bytes)
+                # Check target tier has room
                 if target_state.free < oldest_block.size_bytes:
-                    break
+                    # Can't evict further — target tier is also full
+                    # Try evicting from target tier recursively
+                    if target_tier != MemTier.T2:
+                        self._evict_until(target_tier, oldest_block.size_bytes)
+                    if target_state.free < oldest_block.size_bytes:
+                        break
 
-            # Allocate on target tier (HAL alloc is fast pool sub-allocation)
-            new_block = self._hal.alloc(oldest_block.size_bytes, target_tier)
-            target_state.allocated += new_block.size_bytes
-            target_state.blocks[new_block.block_id] = new_block
+                # Allocate on target tier (HAL alloc is fast pool sub-allocation)
+                new_block = self._hal.alloc(oldest_block.size_bytes, target_tier)
+                target_state.allocated += new_block.size_bytes
+                target_state.blocks[new_block.block_id] = new_block
 
-            # Remove old block from current tier bookkeeping
-            state.blocks.pop(oldest_id, None)
-            state.allocated = max(0, state.allocated - oldest_block.size_bytes)
+                # Remove old block from current tier bookkeeping
+                state.blocks.pop(oldest_id, None)
+                state.allocated = max(0, state.allocated - oldest_block.size_bytes)
 
-            blocks_to_copy.append((oldest_block, new_block))
+                blocks_to_copy.append((oldest_block, new_block))
 
-        result = state.free >= needed
+            result = state.free >= needed
 
-        # PHASE 2: Outside the lock — do the actual copy and free.
-        # HAL.copy() is O(size/bandwidth) and can take milliseconds;
-        # releasing the lock prevents throughput collapse from contention.
-        if blocks_to_copy:
-            self._lock.release()
-            try:
+            # PHASE 2: perform copies with recursion-safe lock behavior.
+            if blocks_to_copy and self._evict_depth == 1:
+                self._lock.release()
+                try:
+                    for src, dst in blocks_to_copy:
+                        self._hal.copy(src, dst)
+                        self._hal.free(src)
+                        logger.debug(
+                            "LRU evict: %s → %s (%s)",
+                            tier,
+                            target_tier,
+                            _human_bytes(src.size_bytes),
+                        )
+                finally:
+                    self._lock.acquire()
+            elif blocks_to_copy:
                 for src, dst in blocks_to_copy:
                     self._hal.copy(src, dst)
                     self._hal.free(src)
                     logger.debug(
-                        "LRU evict: %s → %s (%s)",
+                        "LRU evict (inline): %s → %s (%s)",
                         tier,
                         target_tier,
                         _human_bytes(src.size_bytes),
                     )
-            finally:
-                self._lock.acquire()
 
-        return result
+            return result
+        finally:
+            self._evict_depth -= 1
 
     # ------------------------------------------------------------------
     # prefetch
