@@ -50,6 +50,7 @@ class ZenyxGradScaler:
         self._growth_interval = growth_interval
         self._growth_tracker: int = 0
         self._found_inf: bool = False
+        self._unscaled: bool = False
 
         # Use PyTorch's built-in GradScaler when CUDA is available
         self._scaler: Optional[torch.amp.GradScaler] = None
@@ -105,8 +106,9 @@ class ZenyxGradScaler:
                     if torch.isinf(p.grad).any() or torch.isnan(p.grad).any():
                         self._found_inf = True
                         break
-                    # Unscale gradients
-                    p.grad.div_(self._scale)
+                    # Only unscale if unscale_() was not already called this step.
+                    if not self._unscaled:
+                        p.grad.div_(self._scale)
             if self._found_inf:
                 break
 
@@ -124,6 +126,8 @@ class ZenyxGradScaler:
         if not self._enabled:
             return
 
+        self._unscaled = False  # Reset for next optimizer step.
+
         if self._scaler is not None:
             self._scaler.update()
             return
@@ -140,21 +144,31 @@ class ZenyxGradScaler:
                 logger.debug("Scale increased to %.1f", self._scale)
 
     def unscale_(self, optimizer: torch.optim.Optimizer) -> None:
-        """Unscale gradients for gradient clipping before :meth:`step`.
+        """Unscale gradients for gradient clipping before step().
 
-        If the CUDA ``GradScaler`` is active, delegates to its ``unscale_``
-        method.  If manual scaling is active or the scaler is disabled, this
-        is a no-op (manual unscaling is handled inside :meth:`step`).
+        On the CUDA path, delegates to torch.amp.GradScaler.unscale_().
+        On the manual path, divides all parameter gradients by self._scale
+        in-place, so that clip_grad_norm_ sees true gradient magnitudes.
+        Sets self._unscaled = True to prevent double-unscaling in step().
 
         Args:
             optimizer: The optimizer whose parameter gradients to unscale.
 
-        Time: O(P) where P = number of parameters.  Space: O(1).
+        Time: O(P) where P = number of parameters. Space: O(1).
         """
         if not self._enabled:
             return
         if self._scaler is not None:
             self._scaler.unscale_(optimizer)
+            return
+        # Manual path: unscale gradients now so clip_grad_norm_ works correctly.
+        if self._unscaled:
+            return  # Already unscaled this step — do not double-unscale.
+        for group in optimizer.param_groups:
+            for p in group["params"]:
+                if p.grad is not None:
+                    p.grad.div_(self._scale)
+        self._unscaled = True
 
     def get_scale(self) -> float:
         """Return the current loss scale."""

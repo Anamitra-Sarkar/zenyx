@@ -129,6 +129,7 @@ class AsyncCheckpointer:
         )
         self._lock = threading.Lock()
         self._prev_checksums: Dict[str, str] = {}
+        self._prev_meta_entries: Dict[str, "_ShardMeta"] = {}
         self._pending_futures: List[Future[None]] = []
 
     # -- Public API ---------------------------------------------------------
@@ -158,7 +159,10 @@ class AsyncCheckpointer:
         """
         snapshot: Dict[str, bytes] = {}
         checksums: Dict[str, str] = {}
-        meta_entries: List[_ShardMeta] = []
+        # Start with ALL entries from the previous checkpoint manifest.
+        # Unchanged tensors will keep their old entry (pointing to old shard file).
+        # Changed tensors will have their entry overwritten below.
+        current_meta: Dict[str, _ShardMeta] = dict(self._prev_meta_entries)
 
         for name, tensor in state_dict.items():
             cpu_tensor = tensor.detach().cpu()
@@ -172,24 +176,25 @@ class AsyncCheckpointer:
             checksums[name] = chk
 
             if incremental and self._prev_checksums.get(name) == chk:
-                logger.debug("Incremental skip: %s (unchanged)", name)
+                logger.debug("Incremental skip: %s (unchanged, kept in manifest)", name)
                 continue
 
             filename = f"rank{self.rank}_{name.replace('.', '_')}.pt"
             snapshot[filename] = raw
-            meta_entries.append(
-                _ShardMeta(
-                    name=name,
-                    shape=list(tensor.shape),
-                    dtype=str(tensor.dtype),
-                    filename=filename,
-                    byte_size=len(raw),
-                    checksum=chk,
-                )
+            new_entry = _ShardMeta(
+                name=name,
+                shape=list(tensor.shape),
+                dtype=str(tensor.dtype),
+                filename=filename,
+                byte_size=len(raw),
+                checksum=chk,
             )
+            current_meta[name] = new_entry
+
+        meta_entries = list(current_meta.values())
 
         future: Future[None] = self._executor.submit(
-            self._write_shards, path, snapshot, meta_entries, checksums
+            self._write_shards, path, snapshot, meta_entries, checksums, current_meta
         )
         with self._lock:
             self._pending_futures = [f for f in self._pending_futures if not f.done()]
@@ -303,6 +308,7 @@ class AsyncCheckpointer:
         snapshot: Dict[str, bytes],
         meta_entries: List[_ShardMeta],
         checksums: Dict[str, str],
+        full_meta: Dict[str, "_ShardMeta"],
     ) -> None:
         """Background: write shard files and metadata JSON."""
         ckpt_dir = Path(path)
@@ -310,7 +316,9 @@ class AsyncCheckpointer:
 
         for filename, raw_bytes in snapshot.items():
             shard_path = ckpt_dir / filename
-            shard_path.write_bytes(raw_bytes)
+            tmp_shard = Path(str(shard_path) + ".tmp")
+            tmp_shard.write_bytes(raw_bytes)
+            os.replace(tmp_shard, shard_path)
             logger.debug("Wrote shard %s (%d bytes)", shard_path, len(raw_bytes))
 
         meta_dict = {
@@ -320,11 +328,14 @@ class AsyncCheckpointer:
             "shards": [m.to_dict() for m in meta_entries],
         }
         meta_path = ckpt_dir / f"rank{self.rank}_{_METADATA_FILENAME}"
-        with open(meta_path, "w") as f:
+        tmp_meta = Path(str(meta_path) + ".tmp")
+        with open(tmp_meta, "w") as f:
             json.dump(meta_dict, f, indent=2)
+        os.replace(tmp_meta, meta_path)
 
         with self._lock:
             self._prev_checksums.update(checksums)
+            self._prev_meta_entries = dict(full_meta)
 
         logger.info(
             "Checkpoint saved to %s: %d shards (rank %d).",

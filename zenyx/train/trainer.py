@@ -248,10 +248,13 @@ class Trainer:
 
         try:
             if self._backend == "cuda":
-                from zenyx.core.hal.cuda_hal import CUDAHal
-                self._hal = CUDAHal()
+                from zenyx.core.hal.cuda_hal import CudaHAL
+                self._hal = CudaHAL()
         except Exception as e:
-            logger.debug("HAL init skipped: %s", e)
+            logger.warning(
+                "CUDA HAL init failed — 3-tier memory allocator disabled. "
+                "Training will proceed without TierAllocator. Error: %s", e
+            )
 
         if self._hal is not None:
             try:
@@ -347,7 +350,7 @@ class Trainer:
         if get_world_size() > 1:
             try:
                 from zenyx.ops.vocab.vocab_parallel import VocabParallelCrossEntropy
-                self._loss_fn = VocabParallelCrossEntropy
+                self._loss_fn = VocabParallelCrossEntropy()
                 self._use_vocab_parallel = True
                 logger.info("Using VocabParallelCrossEntropy for distributed loss")
             except ImportError:
@@ -358,7 +361,11 @@ class Trainer:
 
         # --- Step 16: Batch size sanity check ---
         num_params = sum(p.numel() for p in model.parameters())
-        global_batch_tokens = context_len * max(1, gradient_accumulation_steps)
+        global_batch_tokens = (
+            context_len
+            * max(1, self._infer_batch_size())
+            * max(1, gradient_accumulation_steps)
+        )
         min_recommended_tokens_per_step = 65_536
         if global_batch_tokens < min_recommended_tokens_per_step:
             warnings.warn(
@@ -566,13 +573,14 @@ class Trainer:
         accum_loss = 0.0
         micro_step = 0
 
+        _profile_handle = None
+
         for batch in self._dataloader:
             if self._step >= self._total_steps:
                 break
 
             step_start = time.monotonic()
 
-            _profile_handle = self._profiler.start_op("train_step")
 
             # Unpack batch
             if isinstance(batch, (tuple, list)) and len(batch) >= 2:
@@ -601,11 +609,12 @@ class Trainer:
 
             # Backward
             self._grad_scaler.scale(loss).backward()
-            accum_loss += loss.item()
+            accum_loss = accum_loss + loss.detach()
             micro_step += 1
 
             # Optimizer step at accumulation boundary
             if micro_step % self._gradient_accumulation_steps == 0:
+                _profile_handle = self._profiler.start_op("train_step")
                 # Clip gradients
                 if self._grad_clip > 0:
                     self._grad_scaler.unscale_(self._optimizer)
@@ -619,7 +628,11 @@ class Trainer:
                 self._optimizer.zero_grad(set_to_none=True)
 
                 self._step += 1
-                self._last_loss = accum_loss * self._gradient_accumulation_steps
+                self._last_loss = float(
+                    accum_loss.item() * self._gradient_accumulation_steps
+                    if hasattr(accum_loss, "item")
+                    else accum_loss * self._gradient_accumulation_steps
+                )
 
                 # Track step time
                 elapsed = time.monotonic() - step_start
@@ -695,6 +708,7 @@ class Trainer:
                     logger.debug("Controller step skipped: %s", e)
 
                 accum_loss = 0.0
+                micro_step = 0
 
         # Final checkpoint
         if is_main_process():
@@ -777,11 +791,17 @@ class Trainer:
         """Try to infer vocabulary size from model attributes."""
         for attr in ("config", "cfg"):
             cfg = getattr(self._model, attr, None)
-            if cfg is not None:
-                for key in ("vocab_size", "n_vocab", "ntokens"):
+            if cfg is None:
+                continue
+            for key in ("vocab_size", "n_vocab", "ntokens"):
+                # Handle both attribute-style configs (e.g. HuggingFace AttrDict)
+                # and plain dict configs.
+                if isinstance(cfg, dict):
+                    val = cfg.get(key)
+                else:
                     val = getattr(cfg, key, None)
-                    if val is not None:
-                        return int(val)
+                if val is not None:
+                    return int(val)
         return 32000
 
     def _infer_batch_size(self) -> int:
@@ -803,7 +823,7 @@ class Trainer:
         via ``.reshape(-1).sum()`` and emits a ``UserWarning`` so the caller
         is aware they are training without labels.
         """
-        if labels is not None and not self._use_vocab_parallel:
+        if labels is not None:
             if output.dim() == 3:
                 B, S, V = output.shape
                 output = output.view(B * S, V)
@@ -839,7 +859,9 @@ class Trainer:
                 "optimizer_state_dict": self._optimizer.state_dict(),
                 "scheduler_state": self._scheduler.state_dict(),
             }
-            torch.save(state, path)
+            tmp_path = path + ".tmp"
+            torch.save(state, tmp_path)
+            os.replace(tmp_path, path)
             logger.info("Checkpoint saved: %s", path)
         except Exception as e:
             logger.warning("Checkpoint save failed: %s", e)
@@ -854,9 +876,31 @@ class Trainer:
             if self._loader_config is not None:
                 from zenyx.loader.loader import ModelLoader
 
-                full_state = torch.load(
-                    path, map_location=self._device, weights_only=False
-                )
+                # Safety: ensure checkpoint is within checkpoint_dir to prevent
+                # path traversal. Resolve both paths to absolute before comparing.
+                safe_checkpoint_dir = os.path.abspath(self._checkpoint_dir)
+                safe_path = os.path.abspath(path)
+                if not safe_path.startswith(safe_checkpoint_dir + os.sep) and safe_path != safe_checkpoint_dir:
+                    logger.warning(
+                        "Checkpoint path %s is outside checkpoint_dir %s — "
+                        "refusing to load for security.",
+                        path, self._checkpoint_dir,
+                    )
+                    return
+
+                try:
+                    full_state = torch.load(
+                        path, map_location=self._device, weights_only=True
+                    )
+                except Exception:
+                    logger.warning(
+                        "weights_only=True load failed for %s — falling back to "
+                        "weights_only=False. Only use trusted checkpoint files.",
+                        path,
+                    )
+                    full_state = torch.load(
+                        path, map_location=self._device, weights_only=False
+                    )
 
                 self._optimizer.load_state_dict(full_state["optimizer_state_dict"])
                 self._step = full_state.get("step", 0)
