@@ -17,6 +17,14 @@ Fix notes
   self._tiers[MemTier.Tx].allocated / .capacity.  All seven getattr calls
   resolved to 0, making every AllocatorStats snapshot all-zeros.  Fixed by
   calling self._pool.usage() which returns {MemTier: (allocated, capacity)}.
+
+* _prefetch_worker deadlock: the worker closure previously acquired
+  self._lock (RLock) to write self._blocks[bid].  If the main thread was
+  blocked inside _allocate_inner on _space_available.wait() while still
+  holding _lock, the worker would deadlock waiting for the same lock.
+  Fixed by introducing a separate _prefetch_lock (plain threading.Lock)
+  that guards only the _blocks dict writes from the prefetch path.
+  The Condition / _lock is never acquired by any background thread.
 """
 
 from __future__ import annotations
@@ -30,39 +38,25 @@ from typing import Any, Optional
 from zenyx.core.allocator.reuse_heap import ComputeGraph, Op, ReuseHeap
 from zenyx.core.hal.base import MemBlock, MemTier
 
-# Lazy import to allow Phase 1 to land independently.  The actual
-# ``MemoryPool`` class is resolved at first use rather than module load.
 _MemoryPool: Optional[type] = None
 
 
 def _get_memory_pool_class() -> type:
-    """Lazily import :class:`MemoryPool` from the mem_pool module.
-
-    Returns:
-        The ``MemoryPool`` class.
-
-    Raises:
-        ImportError: If the mem_pool module is not yet available.
-    """
     global _MemoryPool
     if _MemoryPool is None:
         from zenyx.core.allocator.mem_pool import MemoryPool
-
         _MemoryPool = MemoryPool
     return _MemoryPool
 
 
 logger = logging.getLogger("zenyx.allocator.tier_allocator")
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
 _MIN_BLOCK_SIZE_MB: int = 2
 _MAX_BLOCK_SIZE_MB: int = 20
 _DEFAULT_BLOCK_SIZE_MB: int = 4
 _THROTTLE_POLL_INTERVAL: float = 0.05  # seconds
 _MAX_EVICTION_RETRIES: int = 200  # ~10 seconds at 50 ms poll
+
 
 # ---------------------------------------------------------------------------
 # AllocatorStats
@@ -71,22 +65,7 @@ _MAX_EVICTION_RETRIES: int = 200  # ~10 seconds at 50 ms poll
 
 @dataclass
 class AllocatorStats:
-    """Snapshot of allocator health and throughput metrics.
-
-    Attributes:
-        t0_used_bytes: Bytes currently allocated in T0 (HBM/VRAM).
-        t0_total_bytes: Total capacity of T0.
-        t1_used_bytes: Bytes currently allocated in T1 (CPU DRAM pinned).
-        t1_total_bytes: Total capacity of T1.
-        t2_used_bytes: Bytes currently allocated in T2 (NVMe SSD).
-        t2_total_bytes: Total capacity of T2.
-        eviction_count: Total evictions performed since allocator creation.
-        prefetch_requests: Total prefetch requests issued.
-        prefetch_hits: Prefetch requests where the block was already resident
-            in the target tier (no work needed).
-        throttle_count: Number of times the allocator had to sleep-wait
-            because all tiers were at capacity.
-    """
+    """Snapshot of allocator health and throughput metrics."""
 
     t0_used_bytes: int = 0
     t0_total_bytes: int = 0
@@ -101,11 +80,6 @@ class AllocatorStats:
 
     @property
     def prefetch_hit_rate(self) -> float:
-        """Fraction of prefetch requests that were already resident.
-
-        Returns:
-            Hit rate in ``[0.0, 1.0]``, or ``0.0`` if no prefetches yet.
-        """
         if self.prefetch_requests == 0:
             return 0.0
         return self.prefetch_hits / self.prefetch_requests
@@ -147,80 +121,57 @@ class TierAllocator:
 
     Thread safety
     -------------
-    All public methods are serialised by ``_lock`` (a ``threading.RLock``).
-    Prefetch I/O is dispatched on a background daemon thread.
+    Public methods serialised by ``_lock`` (RLock + Condition).
+    Prefetch workers use the separate ``_prefetch_lock`` (plain Lock) so
+    they never contend with the allocator's Condition variable.
 
-    Complexity (per call, *N* = tracked blocks, *W* = prefetch window)
-    -------------------------------------------------------------------
-    * :meth:`allocate` — *O(log N)* amortised (heap query + pool alloc).
-    * :meth:`free`     — *O(1)*.
-    * :meth:`step`     — *O(W · I + P · log N)* where *I* = avg inputs
-      per op, *P* = prefetched blocks.
-
-    Args:
-        hardware: Hardware descriptor produced by ``detect_hardware()``.
-        block_size_mb: Block granularity in MiB (clamped to 2–20).
+    Lock ordering (must always be acquired in this order to avoid deadlock):
+        1. _lock  (main allocator state)
+        2. _prefetch_lock  (blocks dict update from prefetch thread)
+    Background prefetch threads acquire ONLY _prefetch_lock.
     """
 
     def __init__(self, hardware: Any, block_size_mb: int = _DEFAULT_BLOCK_SIZE_MB) -> None:
-        """Create a :class:`TierAllocator`.
-
-        Instantiates the underlying :class:`MemoryPool` and
-        :class:`ReuseHeap`, and validates the block size.
-
-        Args:
-            hardware: A ``HardwareInfo`` instance (from ``detect_hardware``).
-            block_size_mb: Desired block size in MiB.  Clamped to
-                ``[2, 20]`` per spec.
-
-        Time:  O(1) plus pool pre-allocation time.
-        Space: O(pool capacity).
-        """
-        # Clamp block size to spec range.
         if block_size_mb < _MIN_BLOCK_SIZE_MB:
             logger.warning(
                 "block_size_mb=%d below minimum %d, clamping",
-                block_size_mb,
-                _MIN_BLOCK_SIZE_MB,
+                block_size_mb, _MIN_BLOCK_SIZE_MB,
             )
             block_size_mb = _MIN_BLOCK_SIZE_MB
         elif block_size_mb > _MAX_BLOCK_SIZE_MB:
             logger.warning(
                 "block_size_mb=%d above maximum %d, clamping",
-                block_size_mb,
-                _MAX_BLOCK_SIZE_MB,
+                block_size_mb, _MAX_BLOCK_SIZE_MB,
             )
             block_size_mb = _MAX_BLOCK_SIZE_MB
 
         self._block_size_bytes: int = block_size_mb * (1 << 20)
         self._hardware = hardware
 
-        # Core components
         PoolCls = _get_memory_pool_class()
         self._pool: Any = PoolCls(hardware, block_size_mb=block_size_mb)
         self._heap: ReuseHeap = ReuseHeap()
 
-        # Compute graph tracking
         self._graph: Optional[ComputeGraph] = None
         self._current_op_idx: int = 0
-
-        # Prefetch configuration
         self.prefetch_window: int = 3
 
-        # Block registry: block_id → MemBlock currently allocated.
         self._blocks: dict[int, MemBlock] = {}
 
-        # Statistics
         self._eviction_count: int = 0
         self._prefetch_requests: int = 0
         self._prefetch_hits: int = 0
         self._throttle_count: int = 0
 
-        # Thread safety
+        # Primary lock + condition for allocation/eviction/throttle.
         self._lock = threading.RLock()
         self._space_available = threading.Condition(self._lock)
 
-        # Prefetch coordination
+        # Separate lock for _blocks dict writes from the prefetch thread.
+        # Background workers ONLY acquire this lock — never _lock — so the
+        # Condition variable cycle is impossible.
+        self._prefetch_lock = threading.Lock()
+
         self._prefetch_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=2,
             thread_name_prefix="zenyx-prefetch",
@@ -242,28 +193,13 @@ class TierAllocator:
         tier: MemTier = MemTier.T0,
         block_id: Optional[int] = None,
     ) -> MemBlock:
-        """Allocate a memory block, evicting if necessary.
+        """Allocate *size_bytes* from *tier*, evicting + throttling if needed.
 
-        Attempts to allocate from the preferred *tier* via the underlying
-        :class:`MemoryPool`.  If the tier is full the allocator uses the
-        :class:`ReuseHeap` to select the best eviction candidate and
-        demotes it to a lower tier, then retries.
+        Never raises OOM — worst case the calling thread sleeps until
+        eviction frees space.
 
-        If **all** tiers are full the calling thread is throttled (sleeps)
-        until space becomes available — eviction is a throughput throttle,
-        **never** an exception.
-
-        Args:
-            size_bytes: Requested allocation size in bytes.
-            tier: Preferred memory tier (default ``T0``).
-            block_id: Optional explicit block identifier.  If ``None`` one
-                is assigned automatically.
-
-        Returns:
-            A :class:`MemBlock` representing the allocated region.
-
-        Time:  O(log N) amortised (eviction heap query).
-        Space: O(1) beyond the allocation itself.
+        Time:  O(log N) amortised.
+        Space: O(1) beyond the allocation.
         """
         with self._lock:
             return self._allocate_inner(size_bytes, tier, block_id)
@@ -274,29 +210,27 @@ class TierAllocator:
         tier: MemTier,
         block_id: Optional[int],
     ) -> MemBlock:
-        """Allocation logic without outer lock (caller holds ``_lock``)."""
+        """Inner allocation loop — caller must hold ``_lock``."""
         retries = 0
 
         while True:
-            # --- Attempt allocation in the pool -------------------------
             try:
                 block = self._pool.allocate(size_bytes, preferred_tier=tier)
                 if block_id is not None:
                     block.block_id = block_id
-                self._blocks[block.block_id] = block
+                # Also update the prefetch-side view of _blocks.
+                with self._prefetch_lock:
+                    self._blocks[block.block_id] = block
                 self._heap.update_access(block.block_id, self._current_op_idx)
                 return block
             except Exception:
-                # Pool could not satisfy the request — need eviction.
                 pass
 
-            # --- Eviction cascade: T0 → T1 → T2 -----------------------
             evicted = self._try_evict(tier)
             if evicted:
                 retries = 0
                 continue
 
-            # --- All tiers full — throttle ------------------------------
             retries += 1
             self._throttle_count += 1
             if retries == 1:
@@ -311,20 +245,13 @@ class TierAllocator:
                     retries,
                     retries * _THROTTLE_POLL_INTERVAL,
                 )
-                # Still do not raise — keep trying.
 
-            # Wait while letting other threads free/evict memory.
+            # wait() atomically releases _lock and blocks, so other threads
+            # (e.g. free()) can acquire _lock, free a block, and notify_all.
             self._space_available.wait(timeout=_THROTTLE_POLL_INTERVAL)
 
     def _try_evict(self, needed_tier: MemTier) -> bool:
-        """Evict one block to make room in *needed_tier*.
-
-        Selects the best candidate from the :class:`ReuseHeap` (Bélády
-        or LRU fallback) and moves it to a lower tier.
-
-        Returns:
-            ``True`` if a block was successfully evicted, ``False``
-            otherwise.
+        """Evict one block into a lower tier. Caller holds ``_lock``.
 
         Time:  O(log N)
         Space: O(1)
@@ -333,27 +260,25 @@ class TierAllocator:
         if candidate_id is None:
             return False
 
-        candidate = self._blocks.get(candidate_id)
+        with self._prefetch_lock:
+            candidate = self._blocks.get(candidate_id)
+
         if candidate is None:
-            # Stale entry — remove from heap and retry next time.
             self._heap.remove_block(candidate_id)
             return False
 
-        # Determine destination tier for eviction.
         dest_tier = self._demote_tier(candidate.tier)
         if dest_tier is None:
-            # Block is already in the lowest tier — nothing to evict to.
             return False
 
         try:
             evicted_block = self._pool.evict(candidate, dest_tier)
-            self._blocks[candidate_id] = evicted_block
+            with self._prefetch_lock:
+                self._blocks[candidate_id] = evicted_block
             self._eviction_count += 1
             logger.debug(
                 "Evicted block %d: %s → %s",
-                candidate_id,
-                candidate.tier.name,
-                dest_tier.name,
+                candidate_id, candidate.tier.name, dest_tier.name,
             )
             return True
         except Exception:
@@ -362,11 +287,6 @@ class TierAllocator:
 
     @staticmethod
     def _demote_tier(current: MemTier) -> Optional[MemTier]:
-        """Return the next lower tier, or ``None`` if already at T2.
-
-        Time:  O(1)
-        Space: O(1)
-        """
         if current == MemTier.T0:
             return MemTier.T1
         if current == MemTier.T1:
@@ -375,11 +295,6 @@ class TierAllocator:
 
     @staticmethod
     def _promote_tier(current: MemTier) -> Optional[MemTier]:
-        """Return the next higher tier, or ``None`` if already at T0.
-
-        Time:  O(1)
-        Space: O(1)
-        """
         if current == MemTier.T2:
             return MemTier.T1
         if current == MemTier.T1:
@@ -391,18 +306,19 @@ class TierAllocator:
     # ------------------------------------------------------------------
 
     def free(self, block: MemBlock) -> None:
-        """Release *block* and remove it from the eviction heap.
+        """Release *block* back to the pool.
 
-        Args:
-            block: Previously allocated :class:`MemBlock`.
+        Acquires _lock first, then _prefetch_lock (lock-ordering rule)
+        so a concurrent prefetch write to _blocks cannot race this free.
 
         Time:  O(1)
         Space: O(1)
         """
         with self._lock:
             bid = block.block_id
-            self._blocks.pop(bid, None)
             self._heap.remove_block(bid)
+            with self._prefetch_lock:
+                self._blocks.pop(bid, None)
             try:
                 self._pool.free(block)
                 self._space_available.notify_all()
@@ -415,18 +331,12 @@ class TierAllocator:
     # ------------------------------------------------------------------
 
     def register_compute_graph(self, graph: ComputeGraph) -> None:
-        """Register (or update) the compute graph for optimal eviction.
+        """Register (or update) the compute graph for Bélády-optimal eviction.
 
-        If a graph was previously registered the heap is rebuilt
-        asynchronously so that in-flight allocations are not stalled.
-        The first registration is synchronous (blocking) to ensure the
-        heap is ready before the first :meth:`step`.
+        First registration is synchronous; subsequent updates rebuild the
+        heap asynchronously so in-flight allocations are not stalled.
 
-        Args:
-            graph: The transformer (or general) compute graph.
-
-        Time:  O(G + N log N) for first registration, O(1) for
-            subsequent (async rebuild).
+        Time:  O(G + N log N) first call; O(1) subsequent.
         Space: O(G + N)
         """
         with self._lock:
@@ -446,30 +356,19 @@ class TierAllocator:
     # ------------------------------------------------------------------
 
     def step(self, op_idx: int) -> None:
-        """Advance the allocator to operation *op_idx*.
+        """Advance the allocator to *op_idx* and schedule prefetches.
 
-        Updates access patterns in the reuse heap for every block
-        consumed by the current operation and triggers asynchronous
-        prefetching for blocks needed within the next
-        :attr:`prefetch_window` operations.
-
-        Args:
-            op_idx: Index of the operation about to execute.
-
-        Time:  O(I + W · I + P · log N)  — I = inputs of current op,
-            W = prefetch window, P = blocks prefetched.
-        Space: O(W · I)
+        Time:  O(I + W·I + P·log N)
+        Space: O(W·I)
         """
         with self._lock:
             self._current_op_idx = op_idx
 
-            # Update heap for blocks consumed by the current op.
             if self._graph is not None and op_idx < len(self._graph.ops):
                 current_op = self._graph.ops[op_idx]
                 for bid in current_op.input_blocks:
                     self._heap.update_access(bid, op_idx)
 
-            # Kick off prefetching in background.
             needed = self._heap.blocks_needed_in_window(
                 op_idx + 1, self.prefetch_window
             )
@@ -477,47 +376,49 @@ class TierAllocator:
                 self._dispatch_prefetch(needed)
 
     def _dispatch_prefetch(self, block_ids: list[int]) -> None:
-        """Schedule async prefetch of *block_ids* to T0.
+        """Schedule async promotion of *block_ids* to T0.
 
-        Blocks that are already in T0 are counted as prefetch hits.
-        The actual data movement is performed on a daemon thread so the
-        calling :meth:`step` returns immediately.
-
-        Args:
-            block_ids: Blocks to promote to T0.
+        Caller holds ``_lock``; snapshot of to_prefetch is taken under
+        ``_prefetch_lock`` so the worker never needs ``_lock``.
 
         Time:  O(P)
         Space: O(P)
         """
         to_prefetch: list[tuple[int, MemBlock]] = []
 
-        for bid in block_ids:
-            self._prefetch_requests += 1
-            block = self._blocks.get(bid)
-            if block is None:
-                continue
-            if block.tier == MemTier.T0:
-                self._prefetch_hits += 1
-                continue
-            to_prefetch.append((bid, block))
+        # Snapshot under _prefetch_lock — worker will also use _prefetch_lock.
+        with self._prefetch_lock:
+            for bid in block_ids:
+                self._prefetch_requests += 1
+                block = self._blocks.get(bid)
+                if block is None:
+                    continue
+                if block.tier == MemTier.T0:
+                    self._prefetch_hits += 1
+                    continue
+                to_prefetch.append((bid, block))
 
         if not to_prefetch:
             return
 
-        # Fire-and-forget daemon thread for the actual data movement.
+        pool_ref = self._pool  # captured outside the lock
+
         def _prefetch_worker() -> None:
+            """Background worker — acquires ONLY _prefetch_lock, never _lock.
+
+            This is the key invariant that breaks the deadlock cycle:
+            the main thread can hold _lock + block on _space_available,
+            and this worker will never attempt to acquire _lock.
+            """
             for bid, blk in to_prefetch:
                 try:
-                    promoted = self._pool.prefetch(blk, MemTier.T0)
-                    with self._lock:
+                    promoted = pool_ref.prefetch(blk, MemTier.T0)
+                    # Write result back under _prefetch_lock only.
+                    with self._prefetch_lock:
                         self._blocks[bid] = promoted
-                    logger.debug(
-                        "Prefetched block %d: %s → T0", bid, blk.tier.name
-                    )
+                    logger.debug("Prefetched block %d: %s → T0", bid, blk.tier.name)
                 except Exception:
-                    logger.debug(
-                        "Prefetch of block %d failed", bid, exc_info=True
-                    )
+                    logger.debug("Prefetch of block %d failed", bid, exc_info=True)
 
         self._prefetch_executor.submit(_prefetch_worker)
 
@@ -526,20 +427,7 @@ class TierAllocator:
     # ------------------------------------------------------------------
 
     def get_stats(self) -> AllocatorStats:
-        """Return a snapshot of allocator health metrics.
-
-        Reads live tier usage from :meth:`MemoryPool.usage` which returns
-        ``{MemTier: (allocated, capacity)}``.
-
-        Fix: the previous implementation used
-        ``getattr(self._pool, "t0_used_bytes", 0)`` etc.  ``MemoryPool``
-        exposes no such top-level attributes — the data lives inside
-        ``self._tiers[MemTier.Tx].allocated / .capacity``.  All seven
-        ``getattr`` calls resolved to 0, making every ``AllocatorStats``
-        snapshot all-zeros.
-
-        Returns:
-            :class:`AllocatorStats` reflecting the current state.
+        """Return a live snapshot of allocator metrics.
 
         Time:  O(1)
         Space: O(1)
@@ -570,12 +458,8 @@ class TierAllocator:
             )
 
     def shutdown(self) -> None:
-        """Shut down internal background resources."""
+        """Shut down background prefetch thread pool."""
         self._prefetch_executor.shutdown(wait=False)
-
-    # ------------------------------------------------------------------
-    # Dunder
-    # ------------------------------------------------------------------
 
     def __del__(self) -> None:
         try:
