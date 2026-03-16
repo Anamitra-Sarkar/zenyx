@@ -79,6 +79,7 @@ if _HAS_TRITON:
         IS_CAUSAL: tl.constexpr,
         q_offset: tl.constexpr,
         kv_offset: tl.constexpr,
+        OUT_DTYPE: tl.constexpr,
     ):
         """Triton FlashAttention-3-style forward kernel with online softmax.
 
@@ -183,7 +184,7 @@ if _HAS_TRITON:
             + d_offsets[None, :] * stride_od
         )
         o_mask = (q_offsets[:, None] < S_Q) & (d_offsets[None, :] < D)
-        tl.store(o_ptrs, o_i.to(tl.float16), mask=o_mask)
+        tl.store(o_ptrs, o_i.to(OUT_DTYPE), mask=o_mask)
 
         # Store LSE for backward / ring accumulation
         lse_ptrs = (
@@ -303,6 +304,13 @@ def _flash_attn_triton(
 
     grid = (triton.cdiv(S_Q, BLOCK_S), H, B)
 
+    _TORCH_TO_TRITON_DTYPE = {
+        torch.float16: tl.float16,
+        torch.bfloat16: tl.bfloat16,
+        torch.float32: tl.float32,
+    }
+    out_dtype = _TORCH_TO_TRITON_DTYPE.get(q.dtype, tl.bfloat16)
+
     _flash_attn_fwd_kernel[grid](
         q,
         k,
@@ -337,6 +345,7 @@ def _flash_attn_triton(
         IS_CAUSAL=causal,
         q_offset=q_offset,
         kv_offset=kv_offset,
+        OUT_DTYPE=out_dtype,
     )
 
     return output, lse

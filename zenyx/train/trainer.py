@@ -145,6 +145,7 @@ class Trainer:
         self._last_loss: float = 0.0
         self._recent_step_times: list[float] = []
         self._compute_graph: Optional[Any] = None
+        self._actual_seq_len: int = 0
 
         # --- Step 1: Hardware detection ---
         from zenyx.core.hal.detector import detect_hardware, HardwareInfo
@@ -527,7 +528,14 @@ class Trainer:
     # ------------------------------------------------------------------
 
     def train(self) -> None:
-        """Run the full training loop."""
+        """Run the full training loop.
+
+        Always saves a final checkpoint after the loop completes, regardless
+        of ``checkpoint_every``. This ensures the final model state is never
+        lost even if the last step is not a multiple of ``checkpoint_every``.
+        Intermediate checkpoints are saved every ``checkpoint_every`` optimizer
+        steps during training.
+        """
         self._model.train()
 
         accum_loss = 0.0
@@ -547,6 +555,10 @@ class Trainer:
 
             if hasattr(inputs, "to"):
                 inputs = inputs.to(self._device, non_blocking=True)
+            # Detect actual sequence length from the first batch.
+            # Expected input shape: [batch, seq_len, ...] — axis 1 is seq_len.
+            if self._actual_seq_len == 0 and hasattr(inputs, "shape") and inputs.ndim >= 2:
+                self._actual_seq_len = inputs.shape[1]
             if labels is not None and hasattr(labels, "to"):
                 labels = labels.to(self._device, non_blocking=True)
 
@@ -593,8 +605,9 @@ class Trainer:
                     self._recent_step_times = self._recent_step_times[-100:]
 
                 batch_size_est = self._infer_batch_size()
+                seq_len_for_throughput = self._actual_seq_len or self._context_len
                 throughput_estimate = (
-                    batch_size_est * self._context_len / elapsed if elapsed > 0 else 0.0
+                    batch_size_est * seq_len_for_throughput / elapsed if elapsed > 0 else 0.0
                 )
 
                 # end_op paired with start_op above — no leaked handles.
@@ -649,6 +662,10 @@ class Trainer:
                 micro_step = 0
 
         if is_main_process():
+            logger.info(
+                "Saving final checkpoint at step %d (unconditional end-of-training save).",
+                self._step,
+            )
             self._save_checkpoint()
             logger.info("Training complete at step %d", self._step)
 
@@ -665,7 +682,8 @@ class Trainer:
             avg_time = sum(self._recent_step_times) / len(self._recent_step_times)
             if avg_time > 0:
                 batch_size_est = self._infer_batch_size()
-                throughput = batch_size_est * self._context_len / avg_time
+                seq_len_for_throughput = self._actual_seq_len or self._context_len
+                throughput = batch_size_est * seq_len_for_throughput / avg_time
 
         pool_usage: Optional[dict] = None
         if self._tier_allocator is not None:
@@ -792,59 +810,53 @@ class Trainer:
         except Exception as e:
             logger.warning("Checkpoint save failed: %s", e)
 
+    def _validate_checkpoint_path(self, path: str) -> None:
+        """Raise ValueError if path is outside checkpoint_dir (prevents directory traversal)."""
+        safe_checkpoint_dir = os.path.abspath(self._checkpoint_dir)
+        safe_path = os.path.abspath(path)
+        if not safe_path.startswith(safe_checkpoint_dir + os.sep) and safe_path != safe_checkpoint_dir:
+            raise ValueError(
+                f"Checkpoint path '{path}' is outside checkpoint_dir "
+                f"'{self._checkpoint_dir}' — refusing to load for security. "
+                "Only checkpoints saved by this Trainer instance are trusted."
+            )
+
     def _load_checkpoint(self, path: str) -> None:
         if not os.path.exists(path):
             logger.warning("Checkpoint not found: %s", path)
             return
 
-        try:
-            if self._loader_config is not None:
-                from zenyx.loader.loader import ModelLoader
+        self._validate_checkpoint_path(path)
 
-                safe_checkpoint_dir = os.path.abspath(self._checkpoint_dir)
-                safe_path = os.path.abspath(path)
-                if not safe_path.startswith(safe_checkpoint_dir + os.sep) and safe_path != safe_checkpoint_dir:
-                    logger.warning(
-                        "Checkpoint path %s is outside checkpoint_dir %s — "
-                        "refusing to load for security.",
-                        path, self._checkpoint_dir,
-                    )
-                    return
+        if self._loader_config is not None:
+            from zenyx.loader.loader import ModelLoader
 
-                try:
-                    full_state = torch.load(
-                        path, map_location=self._device, weights_only=False  # nosec: path validated above
-                    )
-                except Exception as exc:
-                    logger.error(
-                        "Checkpoint load failed for %s: %s. "
-                        "Only use trusted checkpoint files from within checkpoint_dir.",
-                        path, exc,
-                    )
-                    raise
+            full_state = torch.load(
+                path, map_location=self._device, weights_only=False  # nosec: path validated above
+            )
+            self._optimizer.load_state_dict(full_state["optimizer_state_dict"])
+            self._step = full_state.get("step", 0)
+            if "scheduler_state" in full_state:
+                self._scheduler.load_state_dict(full_state["scheduler_state"])
+            elif "scheduler_step" in full_state:
+                for _ in range(full_state["scheduler_step"]):
+                    self._scheduler.step()
 
-                self._optimizer.load_state_dict(full_state["optimizer_state_dict"])
-                self._step = full_state.get("step", 0)
-                if "scheduler_state" in full_state:
-                    self._scheduler.load_state_dict(full_state["scheduler_state"])
-                elif "scheduler_step" in full_state:
-                    for _ in range(full_state["scheduler_step"]):
-                        self._scheduler.step()
-
-                loader = ModelLoader(
-                    hal=self._hal,
-                    hw_info=self._hw_info,
-                    num_buffers=self._loader_config.num_buffers,
-                    prefetch_bytes=self._loader_config.prefetch_bytes,
-                    use_gpu_direct=self._loader_config.use_gpu_direct,
-                    dtype=self._loader_config.dtype,
-                )
-                self._model = loader.load(path, self._model)
-                logger.info(
-                    "Resumed from checkpoint via fast ModelLoader: %s (step %d)",
-                    path, self._step,
-                )
-            else:
+            loader = ModelLoader(
+                hal=self._hal,
+                hw_info=self._hw_info,
+                num_buffers=self._loader_config.num_buffers,
+                prefetch_bytes=self._loader_config.prefetch_bytes,
+                use_gpu_direct=self._loader_config.use_gpu_direct,
+                dtype=self._loader_config.dtype,
+            )
+            self._model = loader.load(path, self._model)
+            logger.info(
+                "Resumed from checkpoint via fast ModelLoader: %s (step %d)",
+                path, self._step,
+            )
+        else:
+            try:
                 state = torch.load(path, map_location=self._device, weights_only=False)  # nosec: path validated above
                 self._model.load_state_dict(state["model_state_dict"])
                 self._optimizer.load_state_dict(state["optimizer_state_dict"])
@@ -855,8 +867,9 @@ class Trainer:
                     for _ in range(state["scheduler_step"]):
                         self._scheduler.step()
                 logger.info("Resumed from checkpoint: %s (step %d)", path, self._step)
-        except Exception as e:
-            logger.warning("Checkpoint load failed: %s", e)
+            except Exception as e:
+                logger.warning("Checkpoint load failed: %s", e)
+                raise
 
 
 # ---------------------------------------------------------------------------
