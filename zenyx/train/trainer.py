@@ -34,6 +34,10 @@ Fix notes
   start_op / end_op tightly around the optimizer step block.
 * Cross-platform atomic checkpoint: os.replace() raises PermissionError on
   Windows when the destination is open. Added shutil.move fallback.
+* OOM retry in main train loop: torch.cuda.OutOfMemoryError was unhandled
+  in the Trainer.train() loop (only _legacy_train had OOM handling). Added
+  a retry block around forward+backward that clears the cache and retries
+  once before re-raising.
 """
 
 from __future__ import annotations
@@ -438,7 +442,11 @@ class Trainer:
                                    if hasattr(self, "_topo_info") else 1)),
             )
             logger.info(
-                "Phase 10: SparseRingAttentionKernel initialized (skip_mode=%s)",
+                "Phase 10: SparseRingAttentionKernel initialized (skip_mode=%s). "
+                "NOTE: Pallas kernel integration is pending — sparse attention is "
+                "initialized but not yet wired into the forward pass. The model "
+                "currently uses the standard dense attention path regardless of "
+                "this setting. See sparse_ring_attn.py execute_step() stub.",
                 sparse_skip_mode,
             )
 
@@ -535,6 +543,14 @@ class Trainer:
         lost even if the last step is not a multiple of ``checkpoint_every``.
         Intermediate checkpoints are saved every ``checkpoint_every`` optimizer
         steps during training.
+
+        OOM handling
+        ------------
+        If a ``torch.cuda.OutOfMemoryError`` is raised during forward or
+        backward, the CUDA cache is cleared and the micro-step is retried
+        once before re-raising. This mirrors the behaviour of the legacy
+        ``_legacy_train`` / ``_safe_forward_backward`` path which was the only
+        place with OOM handling before this fix.
         """
         self._model.train()
 
@@ -562,13 +578,33 @@ class Trainer:
             if labels is not None and hasattr(labels, "to"):
                 labels = labels.to(self._device, non_blocking=True)
 
-            if self._use_amp:
-                with torch.amp.autocast(device_type=self._backend, dtype=self._amp_dtype):
+            # ------------------------------------------------------------------
+            # Forward + backward with OOM retry
+            # Previously only _legacy_train/_safe_forward_backward had OOM
+            # handling; an OOM here would propagate uncaught and kill training.
+            # ------------------------------------------------------------------
+            try:
+                if self._use_amp:
+                    with torch.amp.autocast(device_type=self._backend, dtype=self._amp_dtype):
+                        output = self._model(inputs)
+                        loss = self._compute_loss(output, labels)
+                else:
                     output = self._model(inputs)
                     loss = self._compute_loss(output, labels)
-            else:
-                output = self._model(inputs)
-                loss = self._compute_loss(output, labels)
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                logger.warning(
+                    "OOM at step %d micro_step %d — cleared cache, retrying.",
+                    self._step, micro_step,
+                )
+                # Retry once after cache clear
+                if self._use_amp:
+                    with torch.amp.autocast(device_type=self._backend, dtype=self._amp_dtype):
+                        output = self._model(inputs)
+                        loss = self._compute_loss(output, labels)
+                else:
+                    output = self._model(inputs)
+                    loss = self._compute_loss(output, labels)
 
             loss = loss / self._gradient_accumulation_steps
             self._grad_scaler.scale(loss).backward()
