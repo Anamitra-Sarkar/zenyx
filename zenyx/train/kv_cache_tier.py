@@ -21,13 +21,14 @@ KV cache footprint: 126 layers × 8 GQA KV heads × head_dim=128 × 2 (K+V) × 2
 
 from __future__ import annotations
 
+import collections
 import heapq
 import logging
 import os
 import tempfile
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Deque, Dict, List, Literal, Optional, Tuple
 
 __all__ = [
     "BeladyKVCacheManager",
@@ -278,6 +279,12 @@ class BeladyKVCacheManager:
         # Per-block access schedule: (layer, block) → sorted list of access times
         self._block_access_times: Dict[Tuple[int, int], List[int]] = {}
 
+        # T1 tracking for T1→T2 eviction
+        self._t1_blocks: set[Tuple[int, int]] = set()
+        self._t1_used: int = 0
+        # FIFO queue for T1→T2 eviction (oldest T1 block at left)
+        self._t1_queue: Deque[Tuple[int, int]] = collections.deque()
+
         # Schedule built flag
         self._schedule_built = False
 
@@ -389,6 +396,9 @@ class BeladyKVCacheManager:
         self._t0_heap = []
         self._t0_blocks.clear()
         self._t0_used = 0
+        self._t1_blocks.clear()
+        self._t1_used = 0
+        self._t1_queue.clear()
 
         self._schedule_built = True
         logger.info(
@@ -522,6 +532,9 @@ class BeladyKVCacheManager:
         next_use (max-heap via negation), so the first live entry is always
         the block whose next use is farthest in the future — exactly Bélády-
         optimal.
+
+        After demoting to T1, checks whether T1 is over capacity.  If so,
+        evicts the oldest T1 block (FIFO) to T2 to prevent unbounded T1 growth.
         """
         if not self._t0_blocks:
             return
@@ -532,10 +545,22 @@ class BeladyKVCacheManager:
             if key not in self._t0_blocks:
                 # Stale entry — block was already evicted; skip
                 continue
-            # Found a live T0 block: evict it
+            # Found a live T0 block: evict it to T1
             self._t0_blocks.discard(key)
             self._block_tier[key] = 1  # Demote to T1
             self._t0_used -= self._block_bytes
+            self._t1_blocks.add(key)
+            self._t1_used += self._block_bytes
+            self._t1_queue.append(key)
+
+            # T1 overflow: evict oldest T1 block to T2 (FIFO)
+            while self._t1_used + self._block_bytes > self.t1_capacity_bytes and self._t1_queue:
+                oldest_key = self._t1_queue.popleft()
+                if oldest_key in self._t1_blocks:
+                    self._t1_blocks.discard(oldest_key)
+                    self._block_tier[oldest_key] = 2  # Demote to T2
+                    self._t1_used -= self._block_bytes
+                    logger.debug("T1→T2 eviction: block %s", oldest_key)
             return
 
     def get_block(
@@ -565,9 +590,12 @@ class BeladyKVCacheManager:
             block_id = (device_id + ring_step) % self.world_size
 
         key = (layer_idx, block_id)
-        assert self._block_tier.get(key) == 0, (
-            f"Block {key} not in T0 after prefetch. Tier={self._block_tier.get(key)}"
-        )
+        tier = self._block_tier.get(key)
+        if tier != 0:
+            raise RuntimeError(
+                f"Block {key} not in T0 after prefetch (tier={tier}). "
+                "This indicates an eviction race or scheduler bug."
+            )
         return key
 
     def get_t0_usage_bytes(self) -> int:

@@ -153,6 +153,9 @@ class BraidedPipeline:
         # O(1) lookup index: (microbatch_id, stage_id, StepAction) -> ScheduleStep
         # Built incrementally inside generate_schedule; reset on each call.
         self._step_index: Dict[Tuple[int, int, StepAction], ScheduleStep] = {}
+        # Backward COMM uses a distinct index to avoid colliding with forward COMM.
+        # Key: (microbatch_id, stage_id, StepAction.COMM, "bwd")
+        self._bwd_comm_index: Dict[Tuple[int, int, StepAction, str], ScheduleStep] = {}
 
     # -- Schedule generation ------------------------------------------------
 
@@ -176,6 +179,7 @@ class BraidedPipeline:
         schedule: List[ScheduleStep] = []
         self._step_counter = 0
         self._step_index = {}  # reset index for fresh generation
+        self._bwd_comm_index = {}  # reset backward COMM index
 
         # ---- Forward pass: braided order ----
         for mb in range(self.num_microbatches):
@@ -264,14 +268,9 @@ class BraidedPipeline:
                     depends_on=(bwd_id,),
                 )
                 schedule.append(bwd_comm_step)
-                # Note: COMM key (mb, stage, COMM) is already occupied by the
-                # forward COMM step.  The backward COMM uses a distinct key to
-                # avoid overwriting it.  Backward COMM is only depended on by
-                # nothing in the current schedule; we store it under a sentinel
-                # so future callers can find it if needed.
-                # For now the backward COMM is appended but not indexed —
-                # consistent with the original behaviour where _find_step only
-                # returned the first matching step.
+                # Index the backward COMM step under a distinct key
+                # (separate from the forward COMM index) so callers can find it.
+                self._bwd_comm_index[(mb, stage, StepAction.COMM, "bwd")] = bwd_comm_step
 
         self._schedule = schedule
         logger.info(
@@ -302,6 +301,14 @@ class BraidedPipeline:
         -------
         torch.Tensor
             Aggregated output of the last micro-batch from the last stage.
+
+        Notes
+        -----
+        The ``BACKWARD`` action in the schedule is a **stub** for
+        schedule-verification purposes only.  It does **not** compute real
+        gradients.  Real gradient computation is performed by the Trainer's
+        ``loss.backward()`` call which uses PyTorch autograd over the complete
+        forward graph, not per-stage backward steps.
 
         Complexity
         ----------
@@ -383,6 +390,7 @@ class BraidedPipeline:
         self._stage_to_device.update(new_mapping)
         self._schedule = None
         self._step_index = {}
+        self._bwd_comm_index = {}
         logger.warning(
             "Stage mapping updated — schedule invalidated.  "
             "The next execute() call will regenerate the schedule "

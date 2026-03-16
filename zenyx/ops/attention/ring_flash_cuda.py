@@ -86,12 +86,9 @@ if _HAS_TRITON:
         running log-sum-exp for numerically stable softmax accumulation.
         """
         pid_s = tl.program_id(0)
-        pid_bh = tl.program_id(1)
-
-        # Decode batch and head from flattened index
-        num_heads = tl.num_programs(1) // tl.num_programs(2) if tl.num_programs(2) > 0 else tl.num_programs(1)
-        batch_idx = pid_bh // num_heads
-        head_idx = pid_bh % num_heads
+        # Grid is (cdiv(S_Q, BLOCK_S), H, B) — axis 1 = head, axis 2 = batch.
+        head_idx = tl.program_id(1)
+        batch_idx = tl.program_id(2)
 
         # Query block range
         q_start = pid_s * BLOCK_S
@@ -248,8 +245,12 @@ def _flash_attn_pytorch(
 
     # log-sum-exp and output
     lse = torch.logsumexp(attn, dim=-1)  # [B, H, S_q]
+    # Guard: all-masked rows produce lse=-inf → clamp to 0 to avoid NaN.
+    lse = torch.where(torch.isneginf(lse), torch.zeros_like(lse), lse)
     attn_weights = torch.softmax(attn, dim=-1)
     output = torch.matmul(attn_weights, v)  # [B, H, S_q, D]
+    # Where the entire row was masked (lse==0 after clamping), zero the output.
+    output = torch.where((lse == 0).unsqueeze(-1), torch.zeros_like(output), output)
 
     return output, lse
 
@@ -300,7 +301,7 @@ def _flash_attn_triton(
     BLOCK_S = triton.next_power_of_2(BLOCK_S)
     BLOCK_D = triton.next_power_of_2(BLOCK_D)
 
-    grid = (triton.cdiv(S_Q, BLOCK_S), B * H, 1)
+    grid = (triton.cdiv(S_Q, BLOCK_S), H, B)
 
     _flash_attn_fwd_kernel[grid](
         q,

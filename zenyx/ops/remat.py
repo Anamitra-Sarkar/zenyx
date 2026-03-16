@@ -79,11 +79,9 @@ References
 """
 from __future__ import annotations
 
+import functools
 import logging
 from typing import Any, Callable
-
-import jax
-import jax.core
 
 logger = logging.getLogger("zenyx.ops.remat")
 
@@ -100,6 +98,15 @@ _DEFAULT_THRESHOLD_BYTES: int = 5 * 1024 * 1024  # 5 MB
 # ---------------------------------------------------------------------------
 # Lazy imports for JAX checkpoint types
 # ---------------------------------------------------------------------------
+
+def _get_jax():
+    """Lazy import of jax — returns None when JAX is not installed."""
+    try:
+        import jax  # type: ignore[import-untyped]
+        return jax
+    except ImportError:
+        return None
+
 
 def _get_offloadable():
     """Lazy import of Offloadable — avoids hard dependency on internal JAX paths."""
@@ -139,6 +146,9 @@ def make_offload_policy(threshold_mb: float = 5.0) -> Callable:
     The returned callable is a valid ``CheckpointPolicy`` for use with
     ``jax.checkpoint(policy=...)`` or ``flax.linen.remat(policy=...)``.
 
+    When JAX is not installed this returns a no-op callable so that the module
+    can be imported on CPU-only environments without raising ``ImportError``.
+
     Args:
         threshold_mb: Activation size threshold in megabytes. Tensors larger
             than this are offloaded to pinned host DRAM via async DMA.
@@ -156,6 +166,16 @@ def make_offload_policy(threshold_mb: float = 5.0) -> Callable:
     Time complexity:  O(1) per primitive call during tracing.
     Space complexity: O(1).
     """
+    jax = _get_jax()
+    if jax is None:
+        logger.debug(
+            "JAX not installed — make_offload_policy returning no-op policy. "
+            "Install jax to enable host offloading."
+        )
+        def _noop_policy(*args: Any, **kwargs: Any) -> None:
+            return None
+        return _noop_policy
+
     threshold_bytes = int(threshold_mb * 1024 * 1024)
     Offloadable = _get_offloadable()
     Saveable = _get_saveable()
@@ -167,11 +187,11 @@ def make_offload_policy(threshold_mb: float = 5.0) -> Callable:
             "Upgrade to JAX >= 0.4.25 for host offloading support."
         )
         # Return a policy that always recomputes — still correct, just slower.
-        def _recompute_policy(prim: jax.core.Primitive, *avals: Any, **params: Any) -> Any:
+        def _recompute_policy(prim: Any, *avals: Any, **params: Any) -> Any:
             return jax.checkpoint_policies.nothing_saveable
         return _recompute_policy
 
-    def _offload_policy(prim: jax.core.Primitive, *avals: Any, **params: Any) -> Any:
+    def _offload_policy(prim: Any, *avals: Any, **params: Any) -> Any:
         """Evaluate primitive output size and decide HBM vs host-DRAM placement.
 
         Called by JAX during abstract evaluation (tracing phase), before any
@@ -245,6 +265,9 @@ def make_offload_remat(threshold_mb: float = 5.0) -> Callable:
         def my_layer(x):
             ...
 
+    When JAX is not installed this returns an identity decorator so that the
+    module can be imported in CPU-only environments without raising ``ImportError``.
+
     Args:
         threshold_mb: See :func:`make_offload_policy`.
 
@@ -255,5 +278,24 @@ def make_offload_remat(threshold_mb: float = 5.0) -> Callable:
     Time complexity:  O(1).
     Space complexity: O(1).
     """
+    jax = _get_jax()
+    if jax is None:
+        logger.debug("JAX not installed — make_offload_remat returning identity decorator.")
+        def _identity_decorator(fn: Callable) -> Callable:
+            @functools.wraps(fn)
+            def wrapped(*args: Any, **kwargs: Any) -> Any:
+                return fn(*args, **kwargs)
+            return wrapped
+        return _identity_decorator
+
     policy = make_offload_policy(threshold_mb)
-    return lambda fn: jax.checkpoint(fn, policy=policy, prevent_cse=False)
+
+    def _jax_checkpoint_decorator(fn: Callable) -> Callable:
+        checkpointed_fn = jax.checkpoint(fn, policy=policy, prevent_cse=False)
+
+        @functools.wraps(fn)
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            return checkpointed_fn(*args, **kwargs)
+        return wrapped
+
+    return _jax_checkpoint_decorator
