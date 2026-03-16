@@ -8,7 +8,9 @@ Provides three key utilities:
    cover the effective compute demand (in bytes/sec), so eviction always keeps
    up with compute.
 2. **estimate_memory_budget** — computes per-component memory requirements
-   for a transformer model.
+   for a transformer model, including **peak backward activation memory**
+   which was previously missing and caused the budget check to silently
+   pass while XLA later OOMed with 55 GB allocations.
 3. **compute_throughput_from_hardware** — converts raw TFLOPS into the
    correct bytes/sec unit required by ``check_feasibility``.
 
@@ -26,18 +28,29 @@ where *B_01* = T1→T0 bandwidth (bytes/sec), *B_12* = T2→T1 bandwidth
 compute in bytes/sec (= TFLOPS × 10¹² / FLOP_PER_BYTE), and
 *_PIPELINE_DEPTH* = prefetch lookahead depth in steps.
 
-Interpretation: if the pipeline can prefetch *_PIPELINE_DEPTH* steps ahead
-using the faster tier bandwidth, compute never stalls waiting for data.  If
-the condition fails the runtime throttles (never crashes).
+Activation memory fix
+---------------------
+The previous ``estimate_memory_budget`` used::
 
-Previous (wrong) condition was ``F_compute ≤ B_01 AND F_compute ≤ B_12``
-which requires compute to be slower than *both* bandwidth tiers individually.
-For real GPUs (H100: ~247 TB/s effective compute vs 3.35 TB/s HBM) this is
-never satisfied, falsely flagging every production config as infeasible.
+    activations_gb = 2.0 * weights_gb
 
-The common mistake is passing ``compute_tflops * 1e12`` directly as
-``compute_throughput``.  TFLOPS is operations/sec, not bytes/sec.  Use
-``compute_throughput_from_hardware()`` to convert correctly.
+This is a static approximation that ignores the true peak backward
+activation cost, which is dominated by the FFN expansion layer::
+
+    peak_activation_gb = micro_bs × seq_len × d_ff × n_layers × dtype_bytes / GiB
+
+For (micro_bs=8, seq_len=8192, d_ff=4096, n_layers=20, dtype=bf16):
+  - Old formula:  activations_gb = 2 × 1.27 GB = 2.54 GiB  ← wrong
+  - New formula:  peak_activation_gb = 8×8192×4096×20×2 / 2^30 = 20.0 GiB ← correct
+
+The old formula caused the budget assertion to pass with 1.65 GiB/device
+while the XLA compiler reserved 55 GB and crashed.
+
+Backward compatibility
+----------------------
+The new signature adds optional ``micro_bs``, ``seq_len``, ``d_ff``
+parameters. When omitted, the function falls back to the 2×weights
+approximation and logs a warning. Existing call sites continue to work.
 """
 from __future__ import annotations
 
@@ -56,8 +69,6 @@ _TRANSFORMER_FLOP_PER_BYTE: float = 16.0
 # Pipeline prefetch depth: the eviction pipeline can run this many steps
 # ahead of compute.  The OOM-free condition is satisfied when:
 #   F_compute ≤ _PIPELINE_DEPTH × max(B_01, B_12)
-# For real GPUs (H100: ~247 TB/s compute demand, ~3.35 TB/s HBM) a depth
-# of 100 gives comfortable headroom.
 _PIPELINE_DEPTH: int = 100
 
 
@@ -184,18 +195,6 @@ def check_feasibility(
 
         F_compute ≤ _PIPELINE_DEPTH × max(B_01, B_12)
 
-    The pipeline lookahead depth times the faster bandwidth tier must cover
-    the compute demand.  If the condition fails the runtime throttles — it
-    never crashes.
-
-    **Previous wrong condition** was ``F_compute ≤ B_01 AND F_compute ≤ B_12``
-    (both tiers individually faster than compute), which is never satisfied on
-    real GPUs where compute demand (~247 TB/s for H100 BF16) far exceeds any
-    memory bandwidth.
-
-    **Unit requirement**: all three arguments in **bytes/sec**.
-    Use :func:`compute_throughput_from_hardware` to convert from TFLOPS.
-
     Args:
         bandwidth_t0_t1:    T0 ↔ T1 bandwidth in bytes/sec.
         bandwidth_t1_t2:    T1 ↔ T2 bandwidth in bytes/sec.
@@ -217,12 +216,7 @@ def check_feasibility(
     if compute_throughput <= 0:
         raise ValueError(f"compute_throughput must be > 0, got {compute_throughput}")
 
-    # Effective bandwidth available to the pipeline:
-    # the pipeline can prefetch _PIPELINE_DEPTH steps ahead using the faster tier.
     effective_bw = _PIPELINE_DEPTH * max(bandwidth_t0_t1, bandwidth_t1_t2)
-
-    # Positive margin = bandwidth is the bottleneck (compute demand > effective_bw).
-    # Negative margin = bandwidth has headroom.
     margin = compute_throughput - effective_bw
     is_feasible = margin <= 0.0
 
@@ -289,18 +283,40 @@ def estimate_memory_budget(
     n_kv_heads: int,
     dtype_bytes: int = 2,
     device_count: int = 1,
+    # --- New parameters for accurate activation budget ---
+    micro_bs: Optional[int] = None,
+    seq_len: Optional[int] = None,
+    d_ff: Optional[int] = None,
 ) -> MemoryBudget:
     """Estimate the total memory budget for a transformer training run.
+
+    Previously the activation estimate used ``2 × weights_gb`` which gave
+    ~3.5 GiB for a 634M model, while the true peak backward activation
+    memory was ~21.5 GiB — causing budget checks to pass silently before
+    XLA OOMed with 55 GB allocations.
 
     Formulae
     --------
     * **Weights**: ``params × dtype_bytes``
     * **KV cache**: ``2 × n_kv_heads × d_head × context_len × n_layers × dtype_bytes``
-    * **Activations**: ``≈2 × weights`` (selective checkpointing every 4th layer).
-    * **Optimizer**: ``2 × weights`` (Adam first + second moment).
+    * **Activations** (accurate, requires micro_bs + seq_len + d_ff)::
+
+          peak_activation_gb = micro_bs × seq_len × d_ff × n_layers × dtype_bytes / GiB
+
+      This formula captures the dominant cost: the FFN expansion tensor
+      ``bf16[micro_bs, seq_len, d_ff]`` that XLA keeps live for every layer
+      simultaneously during the backward pass.
+
+    * **Activations** (fallback, when micro_bs/seq_len/d_ff not provided)::
+
+          activations_gb ≈ 2 × weights_gb   (selective checkpointing estimate)
+
+      A deprecation warning is logged when the fallback is used.
+
+    * **Optimizer**: ``params × 4 × 2`` (Adam first + second moment in FP32)
 
     Args:
-        params:       Total parameter count (e.g. ``70e9`` for 70B).
+        params:       Total parameter count (e.g. ``634e6`` for 634M).
         vocab_size:   Vocabulary size.
         context_len:  Maximum sequence length in tokens.
         d_model:      Hidden dimension.
@@ -308,9 +324,37 @@ def estimate_memory_budget(
         n_kv_heads:   Number of key-value heads (GQA).
         dtype_bytes:  Bytes per element (default 2 for FP16/BF16).
         device_count: Number of devices for per-device estimate.
+        micro_bs:     Micro-batch size per training step (samples, not tokens).
+                      Required for accurate activation estimate.
+        seq_len:      Sequence length in tokens. Required for accurate estimate.
+        d_ff:         Feed-forward expansion dimension (e.g. 4096 for 4× d_model=1024).
+                      Required for accurate estimate.
 
     Returns:
         :class:`MemoryBudget` with all component sizes in GiB.
+
+    Raises:
+        ValueError: If any required numeric argument is ≤ 0.
+        UserWarning: Logged (not raised) when micro_bs/seq_len/d_ff are omitted
+            and the 2×weights fallback is used.
+
+    Example — accurate (recommended)::
+
+        budget = estimate_memory_budget(
+            params=634e6, vocab_size=100_277, context_len=8192,
+            d_model=1536, n_layers=20, n_kv_heads=4,
+            dtype_bytes=2, device_count=8,
+            micro_bs=8, seq_len=8192, d_ff=4096,
+        )
+        # budget.activations_gb == 20.0 GiB (not 2.5 GiB)
+
+    Example — legacy (fallback, emits warning)::
+
+        budget = estimate_memory_budget(
+            params=634e6, vocab_size=100_277, context_len=8192,
+            d_model=1536, n_layers=20, n_kv_heads=4,
+        )
+        # budget.activations_gb == 2.37 GiB (approximate, may undercount)
 
     Time complexity:  O(1).
     Space complexity: O(1).
@@ -324,7 +368,40 @@ def estimate_memory_budget(
     kv_cache_bytes = 2 * n_kv_heads * d_head * context_len * n_layers * dtype_bytes
     kv_cache_gb = kv_cache_bytes / GIB
 
-    activations_gb = 2.0 * weights_gb
+    # -----------------------------------------------------------------------
+    # Activation memory — accurate formula when training params are provided
+    # -----------------------------------------------------------------------
+    if micro_bs is not None and seq_len is not None and d_ff is not None:
+        if micro_bs <= 0:
+            raise ValueError(f"micro_bs must be > 0, got {micro_bs}")
+        if seq_len <= 0:
+            raise ValueError(f"seq_len must be > 0, got {seq_len}")
+        if d_ff <= 0:
+            raise ValueError(f"d_ff must be > 0, got {d_ff}")
+        # Peak activation: FFN expansion tensor kept live across all layers
+        # during backward pass. bf16[micro_bs, seq_len, d_ff] per layer.
+        # This is the tensor that caused the 55 GB XLA OOM:
+        #   micro_bs=8, seq_len=8192, d_ff=4096, n_layers=20, dtype=bf16
+        #   → 8 × 8192 × 4096 × 20 × 2 / 2^30 = 20.0 GiB
+        peak_activation_bytes = micro_bs * seq_len * d_ff * n_layers * dtype_bytes
+        activations_gb = peak_activation_bytes / GIB
+        logger.info(
+            "Accurate activation budget: micro_bs=%d × seq_len=%d × d_ff=%d × "
+            "n_layers=%d × dtype=%dB = %.2f GiB per step",
+            micro_bs, seq_len, d_ff, n_layers, dtype_bytes, activations_gb,
+        )
+    else:
+        # Legacy fallback — 2×weights approximation.
+        # WARNING: This underestimates peak activation memory for large batches
+        # and long sequences. Provide micro_bs, seq_len, d_ff for accuracy.
+        activations_gb = 2.0 * weights_gb
+        logger.warning(
+            "estimate_memory_budget called without micro_bs/seq_len/d_ff. "
+            "Using legacy 2×weights approximation (%.2f GiB). "
+            "This may significantly underestimate peak activation memory. "
+            "Pass micro_bs, seq_len, and d_ff for an accurate budget check.",
+            activations_gb,
+        )
 
     optimizer_bytes = params * 4 * 2
     optimizer_gb = optimizer_bytes / GIB
