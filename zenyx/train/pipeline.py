@@ -10,7 +10,7 @@ DynaPipe safe stage reassignment
 Pipeline stage reassignment between micro-batches within one gradient
 accumulation window is mathematically safe (linearity of differentiation,
 proved by DynaPipe — NeurIPS 2025).  Re-optimisation is triggered **only**
-at curriculum boundary shifts or every 1 000 steps (NOT per-step).
+at curriculum boundary shifts or every 1 000 steps (NOT per-step).
 
 Fix notes
 ---------
@@ -21,6 +21,11 @@ Fix notes
 * reassign_stages sets _schedule = None without warning; the next execute()
   regenerates synchronously mid-step causing a silent latency spike.
   Fixed by emitting a logger.warning at the point of invalidation.
+* execute() used torch.tensor(0.0) as a fallback in grad_store and as the
+  return value when the last activation is missing. torch.tensor(0.0)
+  always creates a CPU tensor regardless of where model_stages or
+  microbatches live, causing device mismatches on CUDA. Fixed by inferring
+  device from microbatches[0] and passing device= to all fallback tensors.
 """
 
 from __future__ import annotations
@@ -318,6 +323,10 @@ class BraidedPipeline:
             self.generate_schedule()
         assert self._schedule is not None
 
+        # Infer device from the first microbatch so all fallback tensors
+        # are placed on the same device as the actual activations.
+        fallback_device = microbatches[0].device if microbatches else torch.device("cpu")
+
         # Intermediate activation storage: (mb, stage) -> tensor.
         activations: Dict[Tuple[int, int], torch.Tensor] = {}
         grad_store: Dict[Tuple[int, int], torch.Tensor] = {}
@@ -351,7 +360,8 @@ class BraidedPipeline:
                 # Stub: in production, this would call autograd backward on
                 # the stage output.  Here we record that backward ran.
                 grad_store[(mb, stage)] = activations.get(
-                    (mb, stage), torch.tensor(0.0)
+                    (mb, stage),
+                    torch.tensor(0.0, device=fallback_device),
                 )
 
             elif step.action is StepAction.COMM:
@@ -363,7 +373,10 @@ class BraidedPipeline:
         self._global_step += 1
         # Return last microbatch, last stage activation.
         last_key = (self.num_microbatches - 1, self.num_stages - 1)
-        return activations.get(last_key, torch.tensor(0.0))
+        return activations.get(
+            last_key,
+            torch.tensor(0.0, device=fallback_device),
+        )
 
     # -- DynaPipe safe stage reassignment -----------------------------------
 
