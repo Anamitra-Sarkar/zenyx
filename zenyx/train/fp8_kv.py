@@ -158,24 +158,47 @@ def quantize_kv_fp8_per_head(
     Parameters
     ----------
     k : torch.Tensor
-        Key tensor of shape [..., seq_len, head_dim].
+        Key tensor of shape [..., seq_len, head_dim].  Must have ndim >= 3.
     v : torch.Tensor
-        Value tensor of shape [..., seq_len, head_dim].
+        Value tensor of shape [..., seq_len, head_dim].  Must have ndim >= 3.
 
     Returns
     -------
     (k_fp8, v_fp8, k_scales, v_scales)
+        k_scales : [...] — one scalar per head (all dims except last two).
+        v_scales : [...] — one scalar per head.
+
+    Raises
+    ------
+    ValueError
+        If k or v has ndim < 3. Per-head scaling requires at least one
+        batch/head dimension in addition to (seq_len, head_dim).
     """
+    if k.ndim < 3:
+        raise ValueError(
+            f"quantize_kv_fp8_per_head: k must have ndim >= 3 "
+            f"(got ndim={k.ndim}, shape={tuple(k.shape)}). "
+            "Expected shape [..., seq_len, head_dim] with at least one "
+            "leading batch or head dimension."
+        )
+    if v.ndim < 3:
+        raise ValueError(
+            f"quantize_kv_fp8_per_head: v must have ndim >= 3 "
+            f"(got ndim={v.ndim}, shape={tuple(v.shape)}). "
+            "Expected shape [..., seq_len, head_dim] with at least one "
+            "leading batch or head dimension."
+        )
+
     # K: per-head scaling — single scale for entire head
     k_abs_max = k.abs().amax(dim=(-2, -1), keepdim=True)  # [..., 1, 1]
-    k_scales = (k_abs_max / FP8_E4M3_MAX).squeeze(-2).squeeze(-1)
+    k_scales = (k_abs_max / FP8_E4M3_MAX).squeeze(-2).squeeze(-1)  # [...]
     k_scales = k_scales.clamp(min=1e-12)
     k_scaled = k / k_abs_max.clamp(min=1e-12) * FP8_E4M3_MAX
     k_fp8 = k_scaled.clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).round()
 
     # V: per-head scaling (same approach)
     v_abs_max = v.abs().amax(dim=(-2, -1), keepdim=True)
-    v_scales = (v_abs_max / FP8_E4M3_MAX).squeeze(-2).squeeze(-1)
+    v_scales = (v_abs_max / FP8_E4M3_MAX).squeeze(-2).squeeze(-1)  # [...]
     v_scales = v_scales.clamp(min=1e-12)
     v_scaled = v / v_abs_max.clamp(min=1e-12) * FP8_E4M3_MAX
     v_fp8 = v_scaled.clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).round()
@@ -240,9 +263,11 @@ def dequantize_kv(
     Parameters
     ----------
     k_fp8, v_fp8 : torch.Tensor
-        Quantized tensors.
+        Quantized tensors of shape [..., seq_len, head_dim].
     k_scales, v_scales : torch.Tensor
         Scale tensors from quantization.
+        per_channel: k_scales shape [..., head_dim], v_scales shape [..., seq_len].
+        per_head:    k_scales shape [...], v_scales shape [...].
     strategy : str
         Must match the strategy used during quantization.
 
@@ -254,9 +279,11 @@ def dequantize_kv(
         k_bf16 = k_fp8 * k_scales.unsqueeze(-2)
         v_bf16 = v_fp8 * v_scales.unsqueeze(-1)
     elif strategy == "per_head":
-        # Per-head: k_scales = k_abs_max / FP8_E4M3_MAX (scalar per head)
+        # Per-head: k_scales shape is [...] (all dims except seq_len and head_dim).
         # k_fp8 = k / k_abs_max * FP8_E4M3_MAX
-        # Dequantize: k = k_fp8 * k_scales (since k_scales = k_abs_max / FP8_E4M3_MAX)
+        # Dequantize: k = k_fp8 * k_scales  (where k_scales = k_abs_max / FP8_E4M3_MAX)
+        # Need to broadcast k_scales [...] against k_fp8 [..., seq_len, head_dim]
+        # by unsqueezing the last two dims.
         k_bf16 = k_fp8 * k_scales.unsqueeze(-1).unsqueeze(-1)
         v_bf16 = v_fp8 * v_scales.unsqueeze(-1).unsqueeze(-1)
     else:
