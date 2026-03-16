@@ -288,6 +288,10 @@ class BeladyKVCacheManager:
         # Schedule built flag
         self._schedule_built = False
 
+        # Payload/compute-time estimates (set by build_access_schedule)
+        self._total_payload_gb: float = 0.0
+        self._compute_time_s: float = 0.0
+
         # Validate bandwidth on init
         self.validate_bandwidth()
 
@@ -297,8 +301,12 @@ class BeladyKVCacheManager:
         [DISPUTE 7-A]: Source A says original formula is dimensionally broken.
         Source B says it is valid. We run both and warn if EITHER flags violation.
         """
+        kwargs: dict = {}
+        if self._total_payload_gb > 0:
+            kwargs["total_payload_gb"] = self._total_payload_gb
+            kwargs["compute_time_s"] = self._compute_time_s
         pass_corrected, msg_corrected = validate_bandwidth_corrected(
-            self.nvme_bandwidth_gbs
+            self.nvme_bandwidth_gbs, **kwargs
         )
         pass_original, msg_original = validate_bandwidth_original(
             self.nvme_bandwidth_gbs
@@ -400,6 +408,14 @@ class BeladyKVCacheManager:
         self._t1_used = 0
         self._t1_queue.clear()
 
+        # Compute model-specific payload and conservative compute time for bandwidth validation
+        total_kv_bytes = len(self._block_access_times) * self._block_bytes
+        self._total_payload_gb = total_kv_bytes / (1024 ** 3)
+        # Conservative baseline: assume ~10 GB/s effective compute throughput per device.
+        # This is intentionally conservative; the warning is a hint, not a hard gate.
+        _CONSERVATIVE_THROUGHPUT_GBS = 10.0
+        self._compute_time_s = max(1.0, self._total_payload_gb / _CONSERVATIVE_THROUGHPUT_GBS)
+
         self._schedule_built = True
         logger.info(
             "Access schedule built: %d total accesses, %d unique blocks, "
@@ -409,6 +425,9 @@ class BeladyKVCacheManager:
             self._block_bytes,
             time_step,
         )
+
+        # Re-validate bandwidth with model-specific payload numbers
+        self.validate_bandwidth()
 
     def _get_next_use(self, layer_idx: int, block_id: int, current_time: int) -> int:
         """Get the next access time for a block after current_time.
