@@ -184,7 +184,7 @@ class CudaHAL(HALBase):
         else:
             return self._alloc_t2(aligned)
 
-    def _alloc_t0(self, size: int) -> MemBlock:
+    def _alloc_t0(self, size: int, dtype: torch.dtype = torch.bfloat16) -> MemBlock:
         """Allocate from CUDA device memory.
 
         Returns a zero-size sentinel block on CUDA OOM rather than
@@ -195,10 +195,11 @@ class CudaHAL(HALBase):
         Space complexity: O(size).
         """
         torch.cuda.set_device(self._device)
+        elem_size = torch.empty([], dtype=dtype).element_size()
         try:
             tensor = torch.empty(
-                size // 2,  # FP16 = 2 bytes
-                dtype=torch.float16,
+                size // elem_size,
+                dtype=dtype,
                 device=self._device,
             )
         except torch.cuda.OutOfMemoryError:
@@ -209,14 +210,14 @@ class CudaHAL(HALBase):
                 "CUDA OOM while allocating %s on T0 — returning sentinel; caller must evict",
                 _human_bytes(size),
             )
-            tensor = torch.empty(0, dtype=torch.float16, device=self._device)
+            tensor = torch.empty(0, dtype=dtype, device=self._device)
             # Sentinel: size_bytes=0 signals OOM to alloc()
             return MemBlock(
                 data=tensor,
                 tier=MemTier.T0,
                 size_bytes=0,
                 address=0,
-                dtype="float16",
+                dtype=str(dtype).replace("torch.", ""),
                 shape=(0,),
             )
 
@@ -225,7 +226,7 @@ class CudaHAL(HALBase):
             tier=MemTier.T0,
             size_bytes=size,
             address=tensor.data_ptr(),
-            dtype="float16",
+            dtype=str(dtype).replace("torch.", ""),
             shape=tuple(tensor.shape),
         )
         with self._lock:
@@ -488,7 +489,10 @@ class CudaHAL(HALBase):
         Space complexity: O(M × N) for the output tensor.
         """
         if a.tier != MemTier.T0 or b.tier != MemTier.T0:
-            logger.error("matmul requires both operands on T0; got %s, %s", a.tier, b.tier)
+            raise ValueError(
+                f"matmul requires both tensors in T0 (HBM). Got a.tier={a.tier}, b.tier={b.tier}. "
+                "Promote tensors to T0 before calling matmul."
+            )
 
         result_tensor: torch.Tensor
         if out is not None:

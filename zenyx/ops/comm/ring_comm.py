@@ -328,6 +328,11 @@ class RingCommunicator:
         """
         if self._world_size <= 1:
             return
+        if self._send_req is not None:
+            raise RuntimeError(
+                "send_kv() called while a previous send is still pending. "
+                "Call wait_send() first to avoid buffer corruption."
+            )
         self._send_req = dist.isend(kv, self._next_rank, group=self._process_group)
 
     def recv_kv(self, buffer: torch.Tensor) -> None:
@@ -377,7 +382,8 @@ class RingCommunicator:
         if self._recv_req is not None:
             self._recv_req.wait()
             self._recv_req = None
-        assert self._recv_buffer is not None
+        if self._recv_buffer is None:
+            raise RuntimeError("wait_recv() called before recv_kv() — no pending receive.")
         return self._recv_buffer
 
     def step(self) -> None:

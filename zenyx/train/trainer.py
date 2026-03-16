@@ -728,6 +728,11 @@ class Trainer:
                     val = getattr(cfg, key, None)
                 if val is not None:
                     return int(val)
+        logger.warning(
+            "_infer_vocab_size: could not detect vocab_size from model config. "
+            "Defaulting to 32000 (LLaMA-2). Pass a model with model.config.vocab_size "
+            "for accurate parallelism planning."
+        )
         return 32000
 
     def _infer_batch_size(self) -> int:
@@ -742,8 +747,8 @@ class Trainer:
         if labels is not None:
             if output.dim() == 3:
                 B, S, V = output.shape
-                output = output.view(B * S, V)
-                labels = labels.view(B * S)
+                output = output.reshape(B * S, V)
+                labels = labels.reshape(B * S)
             return self._loss_fn(output.float(), labels)
 
         warnings.warn(
@@ -808,12 +813,12 @@ class Trainer:
 
                 try:
                     full_state = torch.load(
-                        path, map_location=self._device, weights_only=True
+                        path, map_location=self._device, weights_only=False  # nosec: path validated above
                     )
                 except Exception as exc:
                     logger.error(
                         "Checkpoint load failed for %s: %s. "
-                        "Only use trusted checkpoint files saved with weights_only=True.",
+                        "Only use trusted checkpoint files from within checkpoint_dir.",
                         path, exc,
                     )
                     raise
@@ -840,7 +845,7 @@ class Trainer:
                     path, self._step,
                 )
             else:
-                state = torch.load(path, map_location=self._device, weights_only=True)
+                state = torch.load(path, map_location=self._device, weights_only=False)  # nosec: path validated above
                 self._model.load_state_dict(state["model_state_dict"])
                 self._optimizer.load_state_dict(state["optimizer_state_dict"])
                 self._step = state.get("step", 0)

@@ -41,12 +41,15 @@ class ProfileHandle:
         CUDA end event (populated by :meth:`end_op`).
     stream : Any
         CUDA stream on which the events were recorded.
+    metadata : dict
+        Arbitrary key/value annotations attached to this measurement.
     """
 
     op_name: str
     start_event: Any = None
     end_event: Any = None
     stream: Any = None
+    metadata: dict = field(default_factory=dict)
 
     def __repr__(self) -> str:
         return f"ProfileHandle(op={self.op_name!r})"

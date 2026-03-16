@@ -18,7 +18,7 @@ from typing import Literal
 logger = logging.getLogger("zenyx.core.hal.detector")
 
 BackendType = Literal["cuda", "rocm", "xla", "metal", "cpu"]
-InterconnectType = Literal["nvlink", "ici", "pcie", "infiniband", "none"]
+InterconnectType = Literal["nvlink", "ici", "pcie", "infiniband", "xgmi", "none"]
 
 
 # ---------------------------------------------------------------------------
@@ -90,9 +90,9 @@ _KNOWN_GPUS: dict[str, tuple[float, InterconnectType]] = {
 }
 
 _KNOWN_ROCM_GPUS: dict[str, tuple[float, InterconnectType]] = {
-    "MI300X": (1307.0, "infiniband"),
-    "MI300A": (977.0, "infiniband"),
-    "MI250X": (383.0, "infiniband"),
+    "MI300X": (1307.0, "xgmi"),
+    "MI300A": (977.0, "xgmi"),
+    "MI250X": (383.0, "xgmi"),
     "MI250": (362.0, "pcie"),
     "MI210": (181.0, "pcie"),
     "RX 7900": (61.0, "pcie"),
@@ -197,7 +197,7 @@ def _build_rocm_info(
             interconnect = known_interconnect
             break
 
-    bw_t0_t1 = 64.0 * (1024 ** 3) if interconnect == "infiniband" else 32.0 * (1024 ** 3)
+    bw_t0_t1 = 64.0 * (1024 ** 3) if interconnect in ("xgmi", "infiniband") else 32.0 * (1024 ** 3)
 
     return HardwareInfo(
         backend="rocm",
@@ -354,6 +354,11 @@ def _get_system_memory() -> int:
     Space complexity: O(1).
     """
     try:
+        import psutil
+        return psutil.virtual_memory().total
+    except ImportError:
+        pass
+    try:
         mem_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")  # type: ignore[attr-defined]
         return mem_bytes
     except (AttributeError, ValueError):
@@ -379,6 +384,11 @@ def build_hal_for_hardware(hw_info: HardwareInfo):
         from zenyx.core.hal.xla_hal import XlaHAL
 
         return XlaHAL(device_index=0)
+    if hw_info.backend == "metal":
+        logger.info("Metal backend: using CpuHAL (MPS memory management via PyTorch)")
+        from zenyx.core.hal.cpu_hal import CpuHAL
+
+        return CpuHAL(t0_capacity_bytes=hw_info.per_device_memory_bytes)
 
     from zenyx.core.hal.cpu_hal import CpuHAL
 
