@@ -23,6 +23,10 @@ Fix notes
   which created a second copy of the data in a new bytes object before
   passing it to torch.frombuffer.  The fix passes raw_bytes directly to
   torch.frombuffer so no intermediate copy is made.
+* Cross-platform atomic rename: os.replace() raises PermissionError on
+  Windows when the destination file is held open by another process.
+  _write_shards now catches OSError on both the shard and metadata rename
+  and falls back to shutil.move(), which works cross-platform.
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -252,13 +257,7 @@ class AsyncCheckpointer:
 
                 if dtype_torch == torch.bfloat16:
                     # bfloat16 was stored as uint16 raw bytes.
-                    # Fix: pass raw_bytes directly to torch.frombuffer — no
-                    # intermediate numpy array or .tobytes() copy needed.
-                    # The previous code did:
-                    #   arr_u16 = np.frombuffer(raw_bytes, dtype=np.uint16)
-                    #   t = torch.frombuffer(arr_u16.tobytes(), ...)
-                    # arr_u16.tobytes() created a redundant copy; raw_bytes
-                    # already is the bytes object we need.
+                    # Pass raw_bytes directly — no intermediate numpy copy.
                     t = torch.frombuffer(
                         raw_bytes, dtype=torch.uint16
                     ).view(torch.bfloat16)
@@ -310,7 +309,12 @@ class AsyncCheckpointer:
         checksums: Dict[str, str],
         full_meta: Dict[str, "_ShardMeta"],
     ) -> None:
-        """Background: write shard files and metadata JSON."""
+        """Background: write shard files and metadata JSON.
+
+        Uses atomic rename (os.replace) for crash-safety.  Falls back to
+        shutil.move() on Windows where os.replace() raises PermissionError
+        when the destination is held open by another process.
+        """
         ckpt_dir = Path(path)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
@@ -318,7 +322,11 @@ class AsyncCheckpointer:
             shard_path = ckpt_dir / filename
             tmp_shard = Path(str(shard_path) + ".tmp")
             tmp_shard.write_bytes(raw_bytes)
-            os.replace(tmp_shard, shard_path)
+            try:
+                os.replace(tmp_shard, shard_path)
+            except OSError:
+                # Windows: destination may be locked by another process.
+                shutil.move(str(tmp_shard), str(shard_path))
             logger.debug("Wrote shard %s (%d bytes)", shard_path, len(raw_bytes))
 
         meta_dict = {
@@ -331,7 +339,11 @@ class AsyncCheckpointer:
         tmp_meta = Path(str(meta_path) + ".tmp")
         with open(tmp_meta, "w") as f:
             json.dump(meta_dict, f, indent=2)
-        os.replace(tmp_meta, meta_path)
+        try:
+            os.replace(tmp_meta, meta_path)
+        except OSError:
+            # Windows: destination may be locked by another process.
+            shutil.move(str(tmp_meta), str(meta_path))
 
         with self._lock:
             self._prev_checksums.update(checksums)
