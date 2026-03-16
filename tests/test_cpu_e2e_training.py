@@ -181,25 +181,6 @@ class TestCpuE2eTraining:
             lr=3e-4,
         )
 
-        # Monkey-patch to collect per-step losses
-        original_log = trainer._log_every
-        step_losses: dict[int, float] = {}
-
-        # Override _log_every to capture losses at each step
-        class _LossCollectingDataloader:
-            """Wrapper that records losses after each step."""
-            def __init__(self, dl: _SyntheticDataset, trainer: Trainer) -> None:
-                self._dl = dl
-                self._trainer = trainer
-                self._iter: Iterator | None = None
-
-            def __iter__(self) -> Iterator:
-                self._iter = iter(self._dl)
-                return self
-
-            def __next__(self) -> Tuple[torch.Tensor, torch.Tensor]:
-                return next(self._iter)  # type: ignore[arg-type]
-
         # Run training
         trainer.train()
 
@@ -257,7 +238,6 @@ class TestCpuE2eTraining:
         last_loss: list[float] = []
         original_train_step = trainer.train.__func__ if hasattr(trainer.train, "__func__") else None
 
-        # We'll run the trainer but also track loss via a wrapper
         trainer.train()
 
         state = trainer.get_state()

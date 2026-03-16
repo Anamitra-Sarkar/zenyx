@@ -291,9 +291,11 @@ def make_offload_remat(threshold_mb: float = 5.0) -> Callable:
     policy = make_offload_policy(threshold_mb)
 
     def _jax_checkpoint_decorator(fn: Callable) -> Callable:
+        checkpointed_fn = jax.checkpoint(fn, policy=policy, prevent_cse=False)
+
         @functools.wraps(fn)
         def wrapped(*args: Any, **kwargs: Any) -> Any:
-            return jax.checkpoint(fn, policy=policy, prevent_cse=False)(*args, **kwargs)
+            return checkpointed_fn(*args, **kwargs)
         return wrapped
 
     return _jax_checkpoint_decorator
