@@ -115,7 +115,7 @@ def validate_bandwidth_corrected(
     passes = min_bw >= required_bw
     explanation = (
         f"Corrected formula: min(B_01={dram_bandwidth_gbs:.1f}, B_12={nvme_bandwidth_gbs:.1f}) "
-        f"= {min_bw:.2f} GB/s {'≥' if passes else '<'} "
+        f"= {min_bw:.2f} GB/s {'\u2265' if passes else '<'} "
         f"required {required_bw:.2f} GB/s (payload={total_payload_gb:.0f} GB / "
         f"compute={compute_time_s:.0f} s). {'PASS' if passes else 'FAIL'}"
     )
@@ -153,7 +153,7 @@ def validate_bandwidth_original(
     explanation = (
         f"Original formula: 1/B_01 + 1/B_12 = 1/{dram_bandwidth_gbs:.1f} + "
         f"1/{nvme_bandwidth_gbs:.1f} = {lhs:.6f} "
-        f"{'≤' if passes else '>'} 1/Fcompute = {rhs:.6f}. "
+        f"{'\u2264' if passes else '>'} 1/Fcompute = {rhs:.6f}. "
         f"{'PASS' if passes else 'FAIL'}"
     )
     return passes, explanation
@@ -464,6 +464,30 @@ class BeladyKVCacheManager:
         entry = _HeapEntry(next_use=next_use, block_id=block_id, layer_idx=layer_idx)
         heapq.heappush(self._t0_heap, entry)
 
+    def _rebuild_heap_from_t0_blocks(self, current_time: int) -> None:
+        """Rebuild _t0_heap from _t0_blocks when the heap is exhausted by stale skips.
+
+        This is a recovery path. Under normal operation the heap and _t0_blocks
+        stay in sync because every insert into _t0_blocks is paired with a
+        heappush. The heap can become empty while _t0_blocks is non-empty only
+        if the same block is inserted into T0 multiple times without a matching
+        eviction (which would be a bug elsewhere). We handle it defensively here
+        to preserve the T0 budget invariant.
+
+        Complexity: O(N log N) where N = |_t0_blocks|.
+        """
+        logger.warning(
+            "_evict_from_t0: heap exhausted by stale skips but %d live T0 blocks remain. "
+            "Rebuilding heap from _t0_blocks. This indicates a push/pop imbalance.",
+            len(self._t0_blocks),
+        )
+        self._t0_heap = []
+        for key in self._t0_blocks:
+            layer_idx, block_id = key
+            next_use = self._get_next_use(layer_idx, block_id, current_time)
+            entry = _HeapEntry(next_use=next_use, block_id=block_id, layer_idx=layer_idx)
+            heapq.heappush(self._t0_heap, entry)
+
     def prefetch(
         self,
         layer_idx: int,
@@ -554,6 +578,13 @@ class BeladyKVCacheManager:
 
         After demoting to T1, checks whether T1 is over capacity.  If so,
         evicts the oldest T1 block (FIFO) to T2 to prevent unbounded T1 growth.
+
+        Heap-exhaustion guard
+        ---------------------
+        If the entire heap is consumed by stale-skip pops but _t0_blocks is
+        still non-empty (push/pop imbalance), the heap is rebuilt from
+        _t0_blocks and eviction is retried once.  Without this guard, _t0_used
+        would grow without bound, silently breaking the T0 budget invariant.
         """
         if not self._t0_blocks:
             return
@@ -581,6 +612,30 @@ class BeladyKVCacheManager:
                     self._t1_used -= self._block_bytes
                     logger.debug("T1→T2 eviction: block %s", oldest_key)
             return
+
+        # Heap is fully exhausted by stale skips but live T0 blocks remain.
+        # Rebuild heap and retry eviction once to preserve budget invariant.
+        if self._t0_blocks:
+            self._rebuild_heap_from_t0_blocks(current_time)
+            # Retry: pop the newly-rebuilt heap once.
+            if self._t0_heap:
+                entry = heapq.heappop(self._t0_heap)
+                key = (entry.layer_idx, entry.block_id)
+                if key in self._t0_blocks:
+                    self._t0_blocks.discard(key)
+                    self._block_tier[key] = 1
+                    self._t0_used -= self._block_bytes
+                    self._t1_blocks.add(key)
+                    self._t1_used += self._block_bytes
+                    self._t1_queue.append(key)
+
+                    while self._t1_used + self._block_bytes > self.t1_capacity_bytes and self._t1_queue:
+                        oldest_key = self._t1_queue.popleft()
+                        if oldest_key in self._t1_blocks:
+                            self._t1_blocks.discard(oldest_key)
+                            self._block_tier[oldest_key] = 2
+                            self._t1_used -= self._block_bytes
+                            logger.debug("T1→T2 eviction (after heap rebuild): block %s", oldest_key)
 
     def get_block(
         self,
