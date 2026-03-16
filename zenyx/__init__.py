@@ -9,6 +9,9 @@ Exports
 - :class:`Trainer` — full-stack trainer class.
 - :func:`wrap` — wraps a model with Zenyx memory management.
 - :mod:`bench` — benchmarking utilities (memory budget, vs DeepSpeed).
+- :data:`offload_policy` — JAX checkpoint policy for host-DRAM activation
+  offloading. Pass to ``nn.remat(policy=offload_policy)`` to fix the
+  55 GB XLA HBM OOM on TPU v5 lite.
 
 Usage::
 
@@ -19,6 +22,11 @@ Usage::
 
     # Or wrap for manual control
     model = zenyx.wrap(model)
+
+    # JAX training: fix 55 GB OOM with one line
+    from zenyx import offload_policy
+    import flax.linen as nn
+    BlockRemat = nn.remat(Block, policy=offload_policy, prevent_cse=False)
 """
 
 from __future__ import annotations
@@ -49,6 +57,10 @@ __all__ = [
     # Phase 10: Sparse Ring Attention
     "SparseRingAttentionKernel",
     "compute_skip_schedule",
+    # JAX activation offloading (fixes 55 GB XLA HBM OOM)
+    "offload_policy",
+    "make_offload_policy",
+    "make_offload_remat",
 ]
 
 import logging
@@ -57,7 +69,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 logger = logging.getLogger("zenyx")
 
-# ── Phase 4 imports ──────────────────────────────────────────────────────
+# ── Phase 4 imports ──────────────────────────────────────────────────────────────────────────
 
 from zenyx.train.trainer import Trainer
 from zenyx.train.trainer import train as _trainer_train
@@ -76,13 +88,18 @@ from zenyx.train.fp8_kv import quantize_kv_fp8, dequantize_kv, GradientMonitor
 from zenyx.train.ring_curriculum import RingCurriculumManager, CurriculumConfig
 from zenyx.ops.attention.sparse_ring_attn import SparseRingAttentionKernel, compute_skip_schedule
 
+# JAX activation offloading — fixes 55 GB XLA HBM OOM on TPU v5 lite
+# Import is lazy-safe: zenyx.ops.remat only imports jax at call time,
+# so importing zenyx in a PyTorch-only environment does not break.
+from zenyx.ops.remat import offload_policy, make_offload_policy, make_offload_remat
+
 # Convenience: auto-init distributed on import if env vars suggest it
 # but ONLY if ZENYX_AUTO_INIT_DISTRIBUTED=1 is set
 # (don't force init on every import — that breaks testing)
 if os.environ.get("ZENYX_AUTO_INIT_DISTRIBUTED", "0") == "1":
     auto_init_distributed()
 
-# ── Lazy hardware detection ──────────────────────────────────────────────
+# ── Lazy hardware detection ───────────────────────────────────────────────────────────
 
 _hardware_info: Optional[Any] = None
 
@@ -109,7 +126,7 @@ def hardware() -> Any:
     return _auto_detect_hardware()
 
 
-# ── Public API ───────────────────────────────────────────────────────────
+# ── Public API ─────────────────────────────────────────────────────────────────────────
 
 
 def train(
@@ -195,12 +212,12 @@ def wrap(model: Any) -> Any:
     return model
 
 
-# ── bench module re-export ───────────────────────────────────────────────
+# ── bench module re-export ──────────────────────────────────────────────────────────────────────
 
 from zenyx import bench  # noqa: E402
 
 
-# ── Private helpers ──────────────────────────────────────────────────────
+# ── Private helpers ──────────────────────────────────────────────────────────────────────
 
 
 def _count_params(model: Any) -> float:
