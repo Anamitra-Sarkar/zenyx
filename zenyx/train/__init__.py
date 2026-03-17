@@ -25,29 +25,38 @@ from zenyx.train.activation_checkpoint import (
     selective_checkpoint_wrapper,
 )
 
-# Phase 7: KV Cache Tiering
-from zenyx.train.kv_cache_tier import (
-    BeladyKVCacheManager,
-    T0_KV_BUDGET_BYTES,
-    validate_bandwidth_corrected,
-    validate_bandwidth_original,
-)
+# Phase 7: KV Cache Tiering — optional, guarded so import zenyx never crashes
+try:
+    from zenyx.train.kv_cache_tier import (
+        BeladyKVCacheManager,
+        T0_KV_BUDGET_BYTES,
+        validate_bandwidth_corrected,
+        validate_bandwidth_original,
+    )
+except ImportError:
+    pass  # kv_cache_tier requires optional deps; accessed lazily via zenyx.__getattr__
 
-# Phase 8: FP8 KV Quantization
-from zenyx.train.fp8_kv import (
-    quantize_kv_fp8,
-    dequantize_kv,
-    smooth_swiglu_scale,
-    GradientMonitor,
-)
+# Phase 8: FP8 KV Quantization — optional, guarded
+try:
+    from zenyx.train.fp8_kv import (
+        quantize_kv_fp8,
+        dequantize_kv,
+        smooth_swiglu_scale,
+        GradientMonitor,
+    )
+except ImportError:
+    pass  # fp8_kv requires optional deps; accessed lazily via zenyx.__getattr__
 
-# Phase 9: Dynamic Ring Curriculum
-from zenyx.train.ring_curriculum import (
-    RingCurriculumManager,
-    CurriculumConfig,
-    compute_reshard_cost_optimistic,
-    compute_reshard_cost_pessimistic,
-)
+# Phase 9: Dynamic Ring Curriculum — optional, guarded
+try:
+    from zenyx.train.ring_curriculum import (
+        RingCurriculumManager,
+        CurriculumConfig,
+        compute_reshard_cost_optimistic,
+        compute_reshard_cost_pessimistic,
+    )
+except ImportError:
+    pass  # ring_curriculum requires optional deps; accessed lazily via zenyx.__getattr__
 
 __all__ = [
     # mixed_prec
