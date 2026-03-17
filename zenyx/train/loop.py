@@ -32,6 +32,14 @@ Fix notes
   a proxy loss.  This now emits a UserWarning on every call so the user
   cannot silently train on a meaningless gradient signal.
 * Removed unused top-level imports: math, List, Tuple, Union.
+* _oom_guard was defined but never used at the call site in _legacy_train.
+  The training loop now wraps each step in ``with _oom_guard("step"):`` so
+  OOM retries actually fire during training (not just inside _safe_forward_backward).
+* _check_feasibility was passing ``hw['hbm_bytes']`` (HBM capacity in bytes,
+  e.g. 80 GB) as ``bandwidth_t0_t1`` (expected in bytes/sec, e.g. 3.35 TB/s).
+  These differ by ~10×–1000× and produced wildly wrong feasibility results.
+  Fixed: now reads ``hw['hbm_bandwidth_bytes_per_sec']`` with a conservative
+  fallback of 2e12 (2 TB/s, roughly HBM2e) when not set by the detector.
 """
 
 from __future__ import annotations
@@ -81,7 +89,8 @@ def _detect_hardware() -> Dict[str, Any]:
     -------
     Dict[str, Any]
         Keys: ``backend`` (``"cuda"`` | ``"xla"`` | ``"cpu"``),
-        ``device_count``, ``device``, ``hbm_bytes``.
+        ``device_count``, ``device``, ``hbm_bytes``,
+        ``hbm_bandwidth_bytes_per_sec``.
 
     Complexity
     ----------
@@ -92,6 +101,7 @@ def _detect_hardware() -> Dict[str, Any]:
         "device_count": 1,
         "device": torch.device("cpu"),
         "hbm_bytes": 0,
+        "hbm_bandwidth_bytes_per_sec": 0,
     }
 
     if torch.cuda.is_available():
@@ -101,8 +111,17 @@ def _detect_hardware() -> Dict[str, Any]:
         try:
             props = torch.cuda.get_device_properties(0)
             hw["hbm_bytes"] = props.total_mem
+            # PyTorch does not expose HBM bandwidth directly.
+            # Use memory_clock_rate (kHz) * bus_width (bits) / 8 as bytes/sec.
+            hw["hbm_bandwidth_bytes_per_sec"] = (
+                props.memory_clock_rate * 1000  # kHz → Hz
+                * props.memory_bus_width          # bits
+                // 8                              # → bytes
+                * 2                               # DDR double-pumped
+            )
         except Exception:
             hw["hbm_bytes"] = 0
+            hw["hbm_bandwidth_bytes_per_sec"] = 0
         return hw
 
     # Check for XLA / TPU.
@@ -173,6 +192,10 @@ def _check_feasibility(hw: Dict[str, Any], profile: Dict[str, Any]) -> bool:
     Delegates to :func:`zenyx.core.allocator.feasibility.check_feasibility`
     with hardware bandwidth values from *hw*.
 
+    ``bandwidth_t0_t1`` is HBM bandwidth in **bytes/sec** (e.g. ~3.35 TB/s
+    for HBM3), NOT HBM capacity.  Previously ``hw['hbm_bytes']`` (capacity)
+    was passed here, which is wrong by a factor of ~10×–1000×.
+
     Returns *True* if the hard guarantee holds, *False* if throttling is
     needed (but we **never crash**).
 
@@ -185,7 +208,11 @@ def _check_feasibility(hw: Dict[str, Any], profile: Dict[str, Any]) -> bool:
         compute_throughput_from_hardware,
     )
 
-    bandwidth_t0_t1 = hw.get("hbm_bytes", 1) or 1  # bytes/sec (fallback: 1 → infeasible)
+    # hbm_bandwidth_bytes_per_sec: set by _detect_hardware() from
+    # memory_clock_rate * memory_bus_width.  Falls back to 2 TB/s (HBM2e
+    # conservative estimate) if not set or zero.
+    _HBM2E_FALLBACK_BPS: int = 2_000_000_000_000  # 2 TB/s
+    bandwidth_t0_t1 = hw.get("hbm_bandwidth_bytes_per_sec") or _HBM2E_FALLBACK_BPS
     bandwidth_t1_t2 = hw.get("nvme_bw", 7.5e9)
     compute_tflops = hw.get("compute_tflops", 312.0)
     compute_throughput = compute_throughput_from_hardware(compute_tflops)
@@ -479,6 +506,12 @@ def _legacy_train(
 
     logger.info("Starting training loop...")
 
+    # _oom_guard is a stateful context manager: _attempt increments across
+    # successive __exit__ calls.  A single guard instance wraps the entire
+    # training loop so the retry counter accumulates per-training-run, not
+    # per-step.  This matches the intent of _OOM_RETRY_LIMIT.
+    oom_guard = _oom_guard("training-step")
+
     for batch in dataloader:
         if max_steps is not None and step >= max_steps:
             break
@@ -490,13 +523,14 @@ def _legacy_train(
 
         optimizer.zero_grad(set_to_none=True)
 
-        loss = _safe_forward_backward(model, batch, device)
+        with oom_guard:
+            loss = _safe_forward_backward(model, batch, device)
 
-        if loss is not None:
-            # Gradient clipping.
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            total_loss += loss.item()
+            if loss is not None:
+                # Gradient clipping.
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                total_loss += loss.item()
 
         step += 1
 
