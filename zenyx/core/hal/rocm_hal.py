@@ -198,8 +198,9 @@ class RocmHAL(HALBase):
         Uses ``block.data = None`` rather than ``del block.data`` so that
         the tensor's Python refcount is decremented correctly.  ``del``
         removes the attribute but does not guarantee the refcount reaches
-        zero if other references exist (e.g. a live HIP stream op);
-        assigning ``None`` is the correct idiom for nulling a dataclass slot.
+        zero if other references exist (e.g. a live HIP stream op or a
+        copy in progress in _evict_until); assigning ``None`` is the
+        correct idiom for nulling a dataclass slot. Matches cuda_hal.free().
 
         Time complexity:  O(1).
         Space complexity: O(1).
@@ -210,6 +211,9 @@ class RocmHAL(HALBase):
             return
         if block.tier == MemTier.T0:
             self._t0_used = max(0, self._t0_used - block.size_bytes)
+            # Set to None rather than del: decrements refcount correctly,
+            # allowing the HIP caching allocator to reclaim the memory
+            # once all other references also drop.
             block.data = None
         elif block.tier == MemTier.T1:
             self._t1_used = max(0, self._t1_used - block.size_bytes)
