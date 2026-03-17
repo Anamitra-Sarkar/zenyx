@@ -371,7 +371,7 @@ class Trainer:
                 if _layers_attr is not None and hasattr(_layers_attr, "__len__"):
                     num_layers_kv = len(_layers_attr)
                     break
-            ring_degree_kv = max(1, self._topo_info.world_size) if hasattr(self, "_topo_info") else 1
+            ring_degree_kv = max(1, self._topo_info.world_size)
             if isinstance(kv_tier_config, KVTierConfig):
                 cfg = vars(kv_tier_config)
             elif isinstance(kv_tier_config, dict):
@@ -383,7 +383,7 @@ class Trainer:
                 )
                 cfg = {}
             self._kv_cache_manager = BeladyKVCacheManager(
-                world_size=cfg.get("world_size", self._topo_info.world_size if hasattr(self, "_topo_info") else 1),
+                world_size=cfg.get("world_size", self._topo_info.world_size),
                 num_layers=cfg.get("num_layers", num_layers_kv),
                 ring_degree=cfg.get("ring_degree", ring_degree_kv),
                 **{k: v for k, v in cfg.items() if k not in ("world_size", "num_layers", "ring_degree")},
@@ -436,10 +436,8 @@ class Trainer:
                 num_layers=num_layers,
                 seq_len=context_len,
                 window_size=min(131_072, context_len),
-                ring_degree=max(1, (self._topo_info.world_size
-                                    if hasattr(self, "_topo_info") else 1)),
-                world_size=max(1, (self._topo_info.world_size
-                                   if hasattr(self, "_topo_info") else 1)),
+                ring_degree=max(1, self._topo_info.world_size),
+                world_size=max(1, self._topo_info.world_size),
             )
             logger.info(
                 "Phase 10: SparseRingAttentionKernel initialized (skip_mode=%s). "
@@ -475,10 +473,10 @@ class Trainer:
             validate_bandwidth_original,
         )
 
-        b_01_bytes_per_s = getattr(self._hw_info, "bandwidth_t0_t1", 0.0) if hasattr(self, "_hw_info") else 0.0
+        b_01_bytes_per_s = getattr(self._hw_info, "bandwidth_t0_t1", 0.0)
         b_01 = b_01_bytes_per_s / (1024 ** 3)
 
-        b_12_bytes_per_s = getattr(self._hw_info, "bandwidth_t1_t2", 0.0) if hasattr(self, "_hw_info") else 0.0
+        b_12_bytes_per_s = getattr(self._hw_info, "bandwidth_t1_t2", 0.0)
         if b_12_bytes_per_s > 0:
             b_12 = b_12_bytes_per_s / (1024 ** 3)
         else:
@@ -488,7 +486,7 @@ class Trainer:
                 "using conservative default of %.1f GB/s.", b_12,
             )
 
-        compute_tflops = getattr(self._hw_info, "compute_tflops", 0.0) if hasattr(self, "_hw_info") else 0.0
+        compute_tflops = getattr(self._hw_info, "compute_tflops", 0.0)
 
         if b_01 <= 0 or compute_tflops <= 0:
             logger.debug(
@@ -593,11 +591,14 @@ class Trainer:
                     loss = self._compute_loss(output, labels)
             except torch.cuda.OutOfMemoryError:
                 torch.cuda.empty_cache()
+                self._optimizer.zero_grad(set_to_none=True)
+                self._grad_scaler = ZenyxGradScaler(enabled=self._use_amp)  # reset scaler state
+                accum_loss = 0.0
                 logger.warning(
-                    "OOM at step %d micro_step %d — cleared cache, retrying.",
+                    "OOM at step %d micro_step %d — cleared cache, reset gradients, retrying.",
                     self._step, micro_step,
                 )
-                # Retry once after cache clear
+                # Retry once after cache clear and gradient reset
                 if self._use_amp:
                     with torch.amp.autocast(device_type=self._backend, dtype=self._amp_dtype):
                         output = self._model(inputs)
@@ -616,6 +617,18 @@ class Trainer:
                 # Previously opened outside this block, causing the handle to be
                 # overwritten on non-optimizer micro-steps without end_op.
                 _profile_handle = self._profiler.start_op("train_step")
+
+                if self._gradient_monitor is not None and self._fp8_kv:
+                    # Compute global gradient norm as proxy for FP8 anomaly detection.
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self._model.parameters(), float('inf')  # no clip, just compute norm
+                    )
+                    if hasattr(self._grad_scaler, '_scale') and self._grad_scaler._scale is not None:
+                        scale = float(self._grad_scaler._scale)
+                        if scale > 0:
+                            approx_fp8_grad = torch.tensor(float(grad_norm) / scale)
+                            approx_bf16_grad = torch.tensor(float(grad_norm))
+                            self._gradient_monitor.check_gradient(approx_fp8_grad, approx_bf16_grad)
 
                 if self._grad_clip > 0:
                     self._grad_scaler.unscale_(self._optimizer)
@@ -848,13 +861,13 @@ class Trainer:
 
     def _validate_checkpoint_path(self, path: str) -> None:
         """Raise ValueError if path is outside checkpoint_dir (prevents directory traversal)."""
-        safe_checkpoint_dir = os.path.abspath(self._checkpoint_dir)
-        safe_path = os.path.abspath(path)
+        safe_checkpoint_dir = os.path.realpath(self._checkpoint_dir)
+        safe_path = os.path.realpath(path)
         if not safe_path.startswith(safe_checkpoint_dir + os.sep) and safe_path != safe_checkpoint_dir:
             raise ValueError(
-                f"Checkpoint path '{path}' is outside checkpoint_dir "
-                f"'{self._checkpoint_dir}' — refusing to load for security. "
-                "Only checkpoints saved by this Trainer instance are trusted."
+                f"Checkpoint path '{path}' resolves to '{safe_path}' which is outside "
+                f"checkpoint_dir '{self._checkpoint_dir}' (resolved: '{safe_checkpoint_dir}') "
+                "— refusing to load for security."
             )
 
     def _load_checkpoint(self, path: str) -> None:

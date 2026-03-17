@@ -29,6 +29,7 @@ Fix notes
 
 from __future__ import annotations
 
+import atexit
 import concurrent.futures
 import logging
 import threading
@@ -182,6 +183,8 @@ class TierAllocator:
             thread_name_prefix="zenyx-prefetch",
         )
 
+        atexit.register(self.shutdown)
+
         logger.info(
             "TierAllocator created: block_size=%d MiB, hardware=%s",
             block_size_mb,
@@ -228,8 +231,15 @@ class TierAllocator:
                     self._blocks[block.block_id] = block
                 self._heap.update_access(block.block_id, self._current_op_idx)
                 return block
-            except Exception:
-                pass
+            except MemoryError:
+                pass  # Expected: pool full, enter eviction/throttle loop
+            except Exception as e:
+                # Unexpected: log at DEBUG so the throttle loop runs but the error is visible
+                logger.debug(
+                    "Unexpected exception in pool.allocate() (type=%s): %s — "
+                    "treating as capacity exhaustion and entering throttle loop.",
+                    type(e).__name__, e, exc_info=True,
+                )
 
             evicted = self._try_evict(tier)
             if evicted:
@@ -467,10 +477,7 @@ class TierAllocator:
         self._prefetch_executor.shutdown(wait=False)
 
     def __del__(self) -> None:
-        try:
-            self.shutdown()
-        except Exception:
-            pass
+        pass  # atexit handles shutdown; __del__ is a no-op
 
     def __repr__(self) -> str:
         with self._lock:

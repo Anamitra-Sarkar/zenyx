@@ -13,3 +13,4 @@ build/
 *.mmap
 .env
 .venv
+checkpoints/
