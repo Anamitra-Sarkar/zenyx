@@ -137,11 +137,19 @@ class RocmHAL(HALBase):
             return self._alloc_t2(size_bytes)
 
     def _alloc_t0(self, size_bytes: int) -> MemBlock:
+        """Allocate from HIP device memory (T0 / HBM).
+
+        Raises ``RuntimeError`` on OOM rather than silently falling back
+        to T1.  The caller (MemoryPool eviction loop) is responsible for
+        evicting blocks and retrying, matching the CudaHAL contract.
+        """
         try:
             t = torch.empty(size_bytes, dtype=torch.uint8, device=self._device)
-        except torch.cuda.OutOfMemoryError:
-            logger.warning("RocmHAL: T0 OOM for %s — falling back to T1", _human_bytes(size_bytes))
-            return self._alloc_t1(size_bytes)
+        except torch.cuda.OutOfMemoryError as exc:
+            raise RuntimeError(
+                f"RocmHAL: T0 OOM — could not allocate {_human_bytes(size_bytes)} on "
+                f"{self._device}. Evict blocks from T0 before retrying."
+            ) from exc
         self._t0_used += size_bytes
         blk = MemBlock(data=t, tier=MemTier.T0, size_bytes=size_bytes,
                         address=t.data_ptr(), dtype="uint8", shape=t.shape)
@@ -149,10 +157,18 @@ class RocmHAL(HALBase):
         return blk
 
     def _alloc_t1(self, size_bytes: int) -> MemBlock:
+        """Allocate pinned CPU memory (T1).
+
+        pin_memory requires a CUDA/ROCm runtime. Guard with
+        ``torch.cuda.is_available()`` to avoid
+        ``RuntimeError: Cannot pin memory without CUDA``
+        on systems where ROCm is not active (e.g. CPU-only CI).
+        """
         if self._t1_used + size_bytes > self._t1_capacity:
             logger.warning("RocmHAL: T1 capacity exceeded — falling back to T2")
             return self._alloc_t2(size_bytes)
-        t = torch.empty(size_bytes, dtype=torch.uint8, pin_memory=True)
+        _pin = torch.cuda.is_available()
+        t = torch.empty(size_bytes, dtype=torch.uint8, pin_memory=_pin)
         self._t1_used += size_bytes
         blk = MemBlock(data=t, tier=MemTier.T1, size_bytes=size_bytes,
                         address=t.data_ptr(), dtype="uint8", shape=t.shape)
