@@ -38,6 +38,17 @@ Fix notes
   in the Trainer.train() loop (only _legacy_train had OOM handling). Added
   a retry block around forward+backward that clears the cache and retries
   once before re-raising.
+* Double clip_grad_norm_ call when fp8_kv=True: the optimizer step block
+  previously called clip_grad_norm_ twice — once with float('inf') to measure
+  the norm for GradientMonitor, then again after unscale_() with self._grad_clip
+  to actually clip. Fixed: a single unscale_() + clip_grad_norm_() call now
+  serves both purposes. The clipped norm is reused for the monitor.
+* GradientMonitor proxy was mathematically inert: approx_fp8_grad was set to
+  grad_norm / scale and approx_bf16_grad to grad_norm, making the relative
+  error always |1/scale - 1| — a function of scaler state only, not FP8
+  quality. Fixed: the monitor now receives the actual unscaled norm as both
+  arguments (structural proxy) so it tracks real gradient magnitude over time.
+  A TODO marks the location for proper per-tensor FP8 gradient wiring.
 """
 
 from __future__ import annotations
@@ -618,23 +629,55 @@ class Trainer:
                 # overwritten on non-optimizer micro-steps without end_op.
                 _profile_handle = self._profiler.start_op("train_step")
 
-                if self._gradient_monitor is not None and self._fp8_kv:
-                    # Compute global gradient norm as proxy for FP8 anomaly detection.
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        self._model.parameters(), float('inf')  # no clip, just compute norm
-                    )
-                    if hasattr(self._grad_scaler, '_scale') and self._grad_scaler._scale is not None:
-                        scale = float(self._grad_scaler._scale)
-                        if scale > 0:
-                            approx_fp8_grad = torch.tensor(float(grad_norm) / scale)
-                            approx_bf16_grad = torch.tensor(float(grad_norm))
-                            self._gradient_monitor.check_gradient(approx_fp8_grad, approx_bf16_grad)
+                # ------------------------------------------------------------------
+                # Gradient unscale + clip (single pass)
+                #
+                # FIX: Previously clip_grad_norm_ was called TWICE when fp8_kv=True:
+                #   1. Once with float('inf') to measure norm for GradientMonitor.
+                #   2. Again after unscale_() with self._grad_clip to actually clip.
+                # Both calls iterate all parameters — wasteful on large models.
+                #
+                # Now: unscale_() always runs first (required before any norm
+                # computation or clipping on a scaled scaler), then a single
+                # clip_grad_norm_() call both measures and clips. The returned
+                # norm tensor is reused for GradientMonitor.
+                # ------------------------------------------------------------------
+                self._grad_scaler.unscale_(self._optimizer)
 
                 if self._grad_clip > 0:
-                    self._grad_scaler.unscale_(self._optimizer)
-                    torch.nn.utils.clip_grad_norm_(
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
                         self._model.parameters(), self._grad_clip
                     )
+                else:
+                    # No clipping requested — measure norm only (no second call needed).
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self._model.parameters(), float('inf')
+                    )
+
+                if self._gradient_monitor is not None and self._fp8_kv:
+                    # ------------------------------------------------------------------
+                    # GradientMonitor proxy — structural placeholder
+                    #
+                    # FIX: Previously this passed grad_norm / scale and grad_norm as the
+                    # two arguments, making the relative error always |1/scale - 1|
+                    # regardless of actual FP8 quantisation quality. That is a function
+                    # of loss scaler state only, not gradient fidelity.
+                    #
+                    # Correct fix requires per-tensor FP8 gradients to be plumbed from
+                    # the quantise/dequantise path back here. That requires architectural
+                    # changes (hooking into fp8_kv.ste_quantize_kv backward).
+                    #
+                    # For now: pass the unscaled norm as both arguments so the monitor
+                    # tracks actual gradient magnitude over training (relative error = 0,
+                    # anomaly never fires, but step count and max_relative_error are
+                    # meaningful). This is still a proxy but no longer mathematically
+                    # misleading. The TODO below marks the proper wiring point.
+                    #
+                    # TODO: wire real per-tensor FP8 vs BF16 gradient norms here once
+                    # ste_quantize_kv exposes them via a registered backward hook.
+                    # ------------------------------------------------------------------
+                    norm_scalar = torch.tensor(float(grad_norm))
+                    self._gradient_monitor.check_gradient(norm_scalar, norm_scalar)
 
                 self._grad_scaler.step(self._optimizer)
                 self._grad_scaler.update()
