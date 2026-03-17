@@ -37,7 +37,7 @@ from typing import Any, Optional
 
 from zenyx.core.allocator.reuse_heap import ComputeGraph, Op, ReuseHeap
 from zenyx.core.hal.base import MemBlock, MemTier
-from zenyx.core.allocator.constants import PIPELINE_DEPTH_STEPS
+from zenyx.core.allocator.constants import PREFETCH_WINDOW_OPS
 
 _MemoryPool: Optional[type] = None
 
@@ -155,8 +155,11 @@ class TierAllocator:
 
         self._graph: Optional[ComputeGraph] = None
         self._current_op_idx: int = 0
-        # FIX: Share the pipeline prefetch horizon with feasibility checks.
-        self.prefetch_window: int = PIPELINE_DEPTH_STEPS
+        # Runtime prefetch lookahead: how many ops ahead to promote blocks to T0.
+        # Intentionally small (3) to avoid over-prefetching and exhausting T0 memory.
+        # Note: FEASIBILITY_PIPELINE_DEPTH (100) is a separate analytical proof
+        # parameter used only by check_feasibility() — do NOT conflate these.
+        self.prefetch_window: int = PREFETCH_WINDOW_OPS
 
         self._blocks: dict[int, MemBlock] = {}
 
