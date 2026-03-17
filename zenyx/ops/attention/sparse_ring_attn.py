@@ -316,7 +316,7 @@ class SparseRingAttentionKernel:
     head_dim : int
         Head dimension for Pallas BlockSpec.
     num_layers : int
-        Number of transformer layers (for depth assertion).
+        Number of transformer layers (for depth check).
     """
 
     def __init__(
@@ -341,12 +341,18 @@ class SparseRingAttentionKernel:
         self.num_layers = num_layers
         self.device_id = device_id
 
-        # Depth assertion for universal approximation
+        # Depth check for universal approximation guarantee.
+        # This is a hard architectural invariant: sparse ring attention only
+        # guarantees transitivity (UAP) when the model has at least
+        # ceil(seq_len / window_size) layers. Use ValueError instead of assert
+        # so the check fires unconditionally even when Python runs with -O.
         min_depth = math.ceil(seq_len / window_size)
-        assert num_layers >= min_depth, (
-            f"Model too shallow for sparse attention UAP: "
-            f"{num_layers} layers < ceil({seq_len}/{window_size}) = {min_depth}"
-        )
+        if num_layers < min_depth:
+            raise ValueError(
+                f"Model too shallow for sparse attention UAP: "
+                f"{num_layers} layers < ceil({seq_len}/{window_size}) = {min_depth}. "
+                f"Increase num_layers to at least {min_depth} or reduce seq_len/window_size."
+            )
 
         # Compute skip schedule (global, identical on all devices)
         self._skip_schedule = compute_skip_schedule(
