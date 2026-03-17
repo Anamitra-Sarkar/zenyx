@@ -142,6 +142,7 @@ class MemoryPool:
         self._block_size_bytes = _clamp_block_size(block_size_mb * (1 << 20))
         self._lock = threading.RLock()
         self._evict_depth: int = 0
+        self._copy_in_progress: int = 0
         self._throttle_event = threading.Event()
         self._throttle_event.set()  # not throttling initially
 
@@ -220,7 +221,12 @@ class MemoryPool:
             for tier in _tier_fallback_chain(preferred_tier):
                 state = self._tiers[tier]
 
-                if state.free >= aligned:
+                if tier == MemTier.T0 and self._copy_in_progress > 0:
+                    logger.debug(
+                        "Delaying T0 allocation reuse while %d eviction copies in progress",
+                        self._copy_in_progress,
+                    )
+                elif state.free >= aligned:
                     return self._do_alloc(aligned, tier)
 
                 if tier != MemTier.T2:
@@ -347,9 +353,22 @@ class MemoryPool:
             result = state.free >= needed
 
             if blocks_to_copy and self._evict_depth == 1:
+                # NOTE: bookkeeping removes source blocks before copy to avoid
+                # holding the allocator lock over HAL I/O. To minimize reuse
+                # races, T0 allocations are temporarily delayed while copies are
+                # in flight (guarded by _copy_in_progress).
+                assert self._evict_depth == 1
+                self._copy_in_progress += 1
                 self._lock.release()
                 try:
                     for src, dst in blocks_to_copy:
+                        logger.debug(
+                            "LRU evict copy start: src_block_id=%s, %s → %s (%s)",
+                            src.block_id,
+                            tier,
+                            target_tier,
+                            _human_bytes(src.size_bytes),
+                        )
                         self._hal.copy(src, dst)
                         self._hal.free(src)
                         logger.debug(
@@ -360,6 +379,7 @@ class MemoryPool:
                         )
                 finally:
                     self._lock.acquire()
+                    self._copy_in_progress = max(0, self._copy_in_progress - 1)
             elif blocks_to_copy:
                 for src, dst in blocks_to_copy:
                     self._hal.copy(src, dst)
@@ -497,7 +517,7 @@ class MemoryPool:
                 f"({len(t2.blocks)} blocks)"
             )
 
-        raise RuntimeError(
+        message = (
             f"Zenyx TierAllocator: all three memory tiers remain full after "
             f"{timeout:.0f}s throttle wait — {_human_bytes(needed)} needed on T2.\n"
             f"Tier usage: {diag}\n"
@@ -505,6 +525,8 @@ class MemoryPool:
             f"needed before allocating new ones. In a training loop, free "
             f"KV cache blocks at the end of each step."
         )
+        logger.warning(message)
+        raise RuntimeError(message)
 
     # ------------------------------------------------------------------
     # introspection

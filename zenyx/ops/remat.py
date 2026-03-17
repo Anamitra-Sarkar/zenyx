@@ -83,6 +83,11 @@ import functools
 import logging
 from typing import Any, Callable
 
+try:
+    from packaging.version import Version
+except ImportError:  # pragma: no cover - packaging is typically available
+    Version = None  # type: ignore[assignment]
+
 logger = logging.getLogger("zenyx.ops.remat")
 
 # ---------------------------------------------------------------------------
@@ -108,29 +113,48 @@ def _get_jax():
         return None
 
 
+
+
+def _jax_has_public_offloadable(jax_module: Any) -> bool:
+    """Return True when JAX version provides public ad_checkpoint symbols."""
+    version = getattr(jax_module, "__version__", "0.0.0")
+    if Version is not None:
+        return Version(version) >= Version("0.4.25")
+    parts = version.split(".")
+    major = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 0
+    minor = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+    patch = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+    return (major, minor, patch) >= (0, 4, 25)
+
+
 def _get_offloadable():
-    """Lazy import of Offloadable — avoids hard dependency on internal JAX paths."""
+    """Lazy import of Offloadable from the public JAX API only."""
+    jax = _get_jax()
+    if jax is None:
+        return None
+    if not _jax_has_public_offloadable(jax):
+        logger.warning(
+            "Installed JAX version %s is < 0.4.25; Offloadable is not public. "
+            "Falling back to recompute-only policy.",
+            getattr(jax, "__version__", "unknown"),
+        )
+        return None
     try:
         from jax.ad_checkpoint import Offloadable
-        return Offloadable
-    except ImportError:
-        pass
-    try:
-        from jax._src.interpreters.ad import Offloadable  # type: ignore[no-redef]
         return Offloadable
     except ImportError:
         return None
 
 
 def _get_saveable():
-    """Lazy import of Saveable."""
+    """Lazy import of Saveable from the public JAX API only."""
+    jax = _get_jax()
+    if jax is None:
+        return None
+    if not _jax_has_public_offloadable(jax):
+        return None
     try:
         from jax.ad_checkpoint import Saveable
-        return Saveable
-    except ImportError:
-        pass
-    try:
-        from jax._src.interpreters.ad import Saveable  # type: ignore[no-redef]
         return Saveable
     except ImportError:
         return None

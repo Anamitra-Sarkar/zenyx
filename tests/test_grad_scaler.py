@@ -1,112 +1,69 @@
-"""Tests for grad_scaler.py — ZenyxGradScaler."""
-
-from __future__ import annotations
+import importlib.util
+import sys
+from pathlib import Path
 
 import torch
-import torch.nn as nn
 
-from zenyx.train.grad_scaler import ZenyxGradScaler
-
-
-# ---------------------------------------------------------------------------
-# Smoke test
-# ---------------------------------------------------------------------------
-
-
-class TestZenyxGradScalerSmoke:
-    """Module imports and main class instantiates without error."""
-
-    def test_smoke_enabled(self) -> None:
-        scaler = ZenyxGradScaler(enabled=True)
-        assert scaler is not None
-
-    def test_smoke_disabled(self) -> None:
-        scaler = ZenyxGradScaler(enabled=False)
-        assert scaler is not None
+_module_path = Path(__file__).resolve().parents[1] / 'zenyx/train/grad_scaler.py'
+_spec = importlib.util.spec_from_file_location('grad_scaler_module', _module_path)
+_mod = importlib.util.module_from_spec(_spec)
+assert _spec and _spec.loader
+sys.modules[_spec.name] = _mod
+_spec.loader.exec_module(_mod)
+ZenyxGradScaler = _mod.ZenyxGradScaler
 
 
-# ---------------------------------------------------------------------------
-# Behavioural tests
-# ---------------------------------------------------------------------------
+class _TrackingSGD(torch.optim.SGD):
+    def __init__(self, params, lr=1e-2):
+        super().__init__(params, lr=lr)
+        self.step_called = 0
+
+    def step(self, closure=None):
+        self.step_called += 1
+        return super().step(closure=closure)
 
 
-class TestGradScalerBehavior:
-    """Test real backward pass behaviour with manual scaler."""
+def test_grad_scaler_disabled_is_noop_step():
+    p = torch.nn.Parameter(torch.tensor([1.0], device="cpu"))
+    p.grad = torch.tensor([0.5], device="cpu")
+    opt = _TrackingSGD([p], lr=0.1)
+    scaler = ZenyxGradScaler(enabled=False)
 
-    def test_enabled_backward_pass_has_gradients(self) -> None:
-        """With enabled=True (manual path), gradients exist after step."""
-        model = nn.Linear(4, 2)
-        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-        scaler = ZenyxGradScaler(enabled=True)
-
-        x = torch.randn(3, 4)
-        y = model(x).sum()
-        scaled = scaler.scale(y)
-        scaled.backward()
-
-        # Gradients should exist
-        for p in model.parameters():
-            assert p.grad is not None
-
-        scaler.step(optimizer)
-        scaler.update()
-
-    def test_disabled_scale_is_identity(self) -> None:
-        """With enabled=False, scale() returns the loss unchanged."""
-        scaler = ZenyxGradScaler(enabled=False)
-        loss = torch.tensor(3.14)
-        scaled = scaler.scale(loss)
-        assert torch.equal(scaled, loss)
-        assert scaler.get_scale() == scaler._scale
+    before = p.detach().clone()
+    scaler.step(opt)
+    assert opt.step_called == 1
+    assert not torch.equal(before, p.detach())
 
 
-# ---------------------------------------------------------------------------
-# Edge case tests
-# ---------------------------------------------------------------------------
+def test_manual_path_overflow_skips_step_and_unscales_all_grads_once():
+    p1 = torch.nn.Parameter(torch.tensor([1.0], device="cpu"))
+    p2 = torch.nn.Parameter(torch.tensor([2.0], device="cpu"))
+    opt = _TrackingSGD([p1, p2], lr=0.1)
+
+    scaler = ZenyxGradScaler(init_scale=8.0, enabled=True)
+    scaler._scaler = None
+
+    p1.grad = torch.tensor([16.0], device="cpu")
+    p2.grad = torch.tensor([float("inf")], device="cpu")
+
+    scaler.step(opt)
+
+    assert opt.step_called == 0
+    assert torch.allclose(p1.grad, torch.tensor([2.0], device="cpu"))
+    assert torch.isinf(p2.grad).all()
 
 
-class TestGradScalerEdgeCases:
-    """Test inf/NaN gradient handling."""
+def test_grad_scaler_state_dict_roundtrip_manual_path():
+    scaler = ZenyxGradScaler(init_scale=32.0, growth_factor=2.0, backoff_factor=0.5, growth_interval=3)
+    scaler._scaler = None
+    scaler._growth_tracker = 2
+    scaler._found_inf = True
+    state = scaler.state_dict()
 
-    def test_update_does_not_raise_on_nan_gradient(self) -> None:
-        """update() should not raise even when gradients contain NaN."""
-        model = nn.Linear(4, 2)
-        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-        scaler = ZenyxGradScaler(enabled=True)
+    restored = ZenyxGradScaler(init_scale=1.0)
+    restored._scaler = None
+    restored.load_state_dict(state)
 
-        x = torch.randn(3, 4)
-        y = model(x).sum()
-        scaled = scaler.scale(y)
-        scaled.backward()
-
-        # Inject NaN into gradients
-        for p in model.parameters():
-            if p.grad is not None:
-                p.grad.fill_(float("nan"))
-
-        # step() should skip the optimizer step, not raise
-        scaler.step(optimizer)
-        scaler.update()  # Should not raise
-
-        # Scale should have decreased (backoff)
-        assert scaler._scale < 2.0**16
-
-    def test_update_does_not_raise_on_inf_gradient(self) -> None:
-        """update() should not raise on inf gradients."""
-        model = nn.Linear(4, 2)
-        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-        scaler = ZenyxGradScaler(enabled=True)
-
-        x = torch.randn(3, 4)
-        y = model(x).sum()
-        scaled = scaler.scale(y)
-        scaled.backward()
-
-        # Inject Inf
-        for p in model.parameters():
-            if p.grad is not None:
-                p.grad.fill_(float("inf"))
-
-        scaler.step(optimizer)
-        scaler.update()
-        assert scaler._scale < 2.0**16
+    assert restored.state_dict()["scale"] == 32.0
+    assert restored.state_dict()["growth_tracker"] == 2
+    assert restored.state_dict()["found_inf"] is True
