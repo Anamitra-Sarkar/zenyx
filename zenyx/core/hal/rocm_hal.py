@@ -195,6 +195,12 @@ class RocmHAL(HALBase):
     def free(self, block: MemBlock) -> None:
         """Release *block* and return memory to the pool.
 
+        Uses ``block.data = None`` rather than ``del block.data`` so that
+        the tensor's Python refcount is decremented correctly.  ``del``
+        removes the attribute but does not guarantee the refcount reaches
+        zero if other references exist (e.g. a live HIP stream op);
+        assigning ``None`` is the correct idiom for nulling a dataclass slot.
+
         Time complexity:  O(1).
         Space complexity: O(1).
         """
@@ -204,10 +210,10 @@ class RocmHAL(HALBase):
             return
         if block.tier == MemTier.T0:
             self._t0_used = max(0, self._t0_used - block.size_bytes)
-            del block.data
+            block.data = None
         elif block.tier == MemTier.T1:
             self._t1_used = max(0, self._t1_used - block.size_bytes)
-            del block.data
+            block.data = None
         elif block.tier == MemTier.T2:
             self._t2_used = max(0, self._t2_used - block.size_bytes)
             if bid in self._t2_files:
