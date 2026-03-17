@@ -63,11 +63,29 @@ __all__ = [
     "make_offload_remat",
 ]
 
+import importlib.machinery
 import logging
 import os
+import sys
+import types
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 logger = logging.getLogger("zenyx")
+
+# Bootstrap zenyx.train as a namespace package to avoid importing
+# zenyx/train/__init__.py during top-level eager imports.
+_train_pkg = sys.modules.get("zenyx.train")
+if _train_pkg is None:
+    _train_pkg = types.ModuleType("zenyx.train")
+    train_path = str(Path(__file__).resolve().parent / "train")
+    _train_pkg.__path__ = [train_path]  # type: ignore[attr-defined]
+    _train_pkg.__package__ = "zenyx.train"
+    _train_pkg.__spec__ = importlib.machinery.ModuleSpec(
+        name="zenyx.train", loader=None, is_package=True
+    )
+    _train_pkg.__spec__.submodule_search_locations = [train_path]
+    sys.modules["zenyx.train"] = _train_pkg
 
 # ── Phase 4 imports ──────────────────────────────────────────────────────────────────────────
 
@@ -82,22 +100,53 @@ from zenyx.train.distributed_setup import (
 )
 from zenyx.loader.loader import ModelLoader, load_model
 
-# Phase 7-10 imports
-from zenyx.train.kv_cache_tier import BeladyKVCacheManager
-from zenyx.train.fp8_kv import quantize_kv_fp8, dequantize_kv, GradientMonitor
-from zenyx.train.ring_curriculum import RingCurriculumManager, CurriculumConfig
-from zenyx.ops.attention.sparse_ring_attn import SparseRingAttentionKernel, compute_skip_schedule
-
-# JAX activation offloading — fixes 55 GB XLA HBM OOM on TPU v5 lite
-# Import is lazy-safe: zenyx.ops.remat only imports jax at call time,
-# so importing zenyx in a PyTorch-only environment does not break.
-from zenyx.ops.remat import offload_policy, make_offload_policy, make_offload_remat
-
 # Convenience: auto-init distributed on import if env vars suggest it
 # but ONLY if ZENYX_AUTO_INIT_DISTRIBUTED=1 is set
 # (don't force init on every import — that breaks testing)
 if os.environ.get("ZENYX_AUTO_INIT_DISTRIBUTED", "0") == "1":
     auto_init_distributed()
+
+
+def __getattr__(name: str) -> Any:
+    """Lazily import optional heavy / JAX-dependent symbols on first access."""
+    lazy_imports = {
+        "BeladyKVCacheManager": ("zenyx.train.kv_cache_tier", "BeladyKVCacheManager"),
+        "quantize_kv_fp8": ("zenyx.train.fp8_kv", "quantize_kv_fp8"),
+        "dequantize_kv": ("zenyx.train.fp8_kv", "dequantize_kv"),
+        "GradientMonitor": ("zenyx.train.fp8_kv", "GradientMonitor"),
+        "RingCurriculumManager": ("zenyx.train.ring_curriculum", "RingCurriculumManager"),
+        "CurriculumConfig": ("zenyx.train.ring_curriculum", "CurriculumConfig"),
+        "SparseRingAttentionKernel": (
+            "zenyx.ops.attention.sparse_ring_attn",
+            "SparseRingAttentionKernel",
+        ),
+        "compute_skip_schedule": (
+            "zenyx.ops.attention.sparse_ring_attn",
+            "compute_skip_schedule",
+        ),
+        "offload_policy": ("zenyx.ops.remat", "offload_policy"),
+        "make_offload_policy": ("zenyx.ops.remat", "make_offload_policy"),
+        "make_offload_remat": ("zenyx.ops.remat", "make_offload_remat"),
+    }
+
+    if name not in lazy_imports:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    module_name, attr_name = lazy_imports[name]
+
+    if attr_name in {"offload_policy", "make_offload_policy", "make_offload_remat"}:
+        try:
+            module = __import__(module_name, fromlist=[attr_name])
+        except ImportError as exc:
+            raise ImportError(
+                "offload_policy requires JAX. Install with: pip install jax[cuda]"
+            ) from exc
+    else:
+        module = __import__(module_name, fromlist=[attr_name])
+
+    value = getattr(module, attr_name)
+    globals()[name] = value
+    return value
 
 # ── Lazy hardware detection ───────────────────────────────────────────────────────────
 

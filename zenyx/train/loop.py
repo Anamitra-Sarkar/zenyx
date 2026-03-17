@@ -39,8 +39,7 @@ from __future__ import annotations
 import logging
 import os
 import warnings
-from contextlib import contextmanager
-from typing import Any, Callable, Dict, Iterator, Optional
+from typing import Any, Callable, Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -210,62 +209,33 @@ def _check_feasibility(hw: Dict[str, Any], profile: Dict[str, Any]) -> bool:
 # ---------------------------------------------------------------------------
 
 
-@contextmanager
-def _oom_guard_once(label: str, attempt: int) -> Iterator[None]:
-    """Single-attempt OOM guard.  Yields once; catches OutOfMemoryError.
+class _oom_guard:
+    def __init__(self, label: str = "step") -> None:
+        self._label = label
+        self._attempt = 0
 
-    Raises _OOMRetry if an OOM is caught so the caller can retry.
-    Re-raises any other exception immediately with a diagnostic log entry.
-    """
-    try:
-        yield
-    except torch.cuda.OutOfMemoryError:
-        logger.warning(
-            "OOM during %s (attempt %d/%d) — evicting caches and retrying.",
-            label,
-            attempt + 1,
-            _OOM_RETRY_LIMIT,
-        )
-        torch.cuda.empty_cache()
-        raise _OOMRetry
+    def __enter__(self) -> "_oom_guard":
+        return self
 
-
-class _OOMRetry(Exception):
-    """Internal sentinel: OOM was caught; caller should retry."""
-
-
-@contextmanager
-def _oom_guard(label: str = "step") -> Iterator[None]:
-    """Context manager that retries the body up to _OOM_RETRY_LIMIT times.
-
-    The previous implementation used ``yield`` inside a ``for`` loop inside a
-    ``@contextmanager`` function.  A generator-based context manager can only
-    yield once; after the caller's ``with`` block exits the generator resumes
-    at the statement *after* ``yield``, which was a ``return`` — so the loop
-    never reached attempt 2 or 3.  Retry logic was silently dead.
-
-    This implementation drives retries *outside* the generator by catching the
-    ``_OOMRetry`` sentinel.  Each attempt calls ``_oom_guard_once``, which
-    creates a fresh generator that yields exactly once.
-
-    Complexity
-    ----------
-    Time *O(1)* overhead per attempt.
-    """
-    for attempt in range(_OOM_RETRY_LIMIT):
-        try:
-            with _oom_guard_once(label, attempt):
-                yield
-            return  # body completed without OOM
-        except _OOMRetry:
-            if attempt == _OOM_RETRY_LIMIT - 1:
-                logger.error(
-                    "Persistent OOM after %d retries in %s — "
-                    "reducing batch and continuing.",
-                    _OOM_RETRY_LIMIT,
-                    label,
-                )
-                return
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+        if exc_type is torch.cuda.OutOfMemoryError:
+            self._attempt += 1
+            logger.warning(
+                "OOM during %s (attempt %d/%d) — evicting caches and retrying.",
+                self._label,
+                self._attempt,
+                _OOM_RETRY_LIMIT,
+            )
+            torch.cuda.empty_cache()
+            if self._attempt < _OOM_RETRY_LIMIT:
+                return True
+            logger.error(
+                "Persistent OOM after %d retries in %s — reducing batch and continuing.",
+                _OOM_RETRY_LIMIT,
+                self._label,
+            )
+            return True
+        return False
 
 
 def _safe_forward_backward(
