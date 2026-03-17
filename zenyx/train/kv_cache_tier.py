@@ -215,6 +215,12 @@ class BeladyKVCacheManager:
     every eviction.  Stale entries (blocks no longer in T0) are lazily
     skipped during heappop.
 
+    Bandwidth validation runs only after ``build_access_schedule()`` is called,
+    at which point ``_total_payload_gb`` and ``_compute_time_s`` are set from
+    the actual model.  It is NOT called in ``__init__`` because those fields
+    are 0.0 at construction time and would cause the check to run against the
+    hardcoded 120B/1M-token defaults instead of the real model.
+
     Parameters
     ----------
     world_size : int
@@ -288,15 +294,21 @@ class BeladyKVCacheManager:
         # Schedule built flag
         self._schedule_built = False
 
-        # Payload/compute-time estimates (set by build_access_schedule)
+        # Payload/compute-time estimates (set by build_access_schedule).
+        # validate_bandwidth() is intentionally NOT called here — these are
+        # 0.0 at construction time and would trigger checks against hardcoded
+        # defaults.  The real check fires at the end of build_access_schedule().
         self._total_payload_gb: float = 0.0
         self._compute_time_s: float = 0.0
 
-        # Validate bandwidth on init
-        self.validate_bandwidth()
-
     def validate_bandwidth(self) -> None:
         """Run BOTH feasibility formulas and log results.
+
+        Only meaningful after ``build_access_schedule()`` has been called, at
+        which point ``_total_payload_gb`` and ``_compute_time_s`` reflect the
+        actual model.  When called before that (``_total_payload_gb == 0``),
+        the corrected formula falls back to the hardcoded 120B/1M-token
+        defaults from ``validate_bandwidth_corrected``'s default arguments.
 
         [DISPUTE 7-A]: Source A says original formula is dimensionally broken.
         Source B says it is valid. We run both and warn if EITHER flags violation.
@@ -426,7 +438,7 @@ class BeladyKVCacheManager:
             time_step,
         )
 
-        # Re-validate bandwidth with model-specific payload numbers
+        # Validate bandwidth now that _total_payload_gb and _compute_time_s are set
         self.validate_bandwidth()
 
     def _get_next_use(self, layer_idx: int, block_id: int, current_time: int) -> int:
