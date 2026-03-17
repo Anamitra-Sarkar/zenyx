@@ -366,32 +366,58 @@ def _get_system_memory() -> int:
         return 16 * (1024 ** 3)
 
 
-def build_hal_for_hardware(hw_info: HardwareInfo):
+def build_hal_for_hardware(hw_info: HardwareInfo, device_index: int = 0):
     """Instantiate the appropriate HAL backend for *hw_info*.
+
+    This is a **single-device factory**.  To use all devices on a
+    multi-GPU / multi-chip host, call this function once per device index
+    (``0`` through ``hw_info.device_count - 1``) and manage the resulting
+    HAL list yourself.
+
+    Args:
+        hw_info:      Hardware descriptor from :func:`detect_hardware`.
+        device_index: Which device to build the HAL for (default ``0``).
+                      Must be in ``range(hw_info.device_count)``.
+
+    Raises:
+        ValueError: If *device_index* is out of range.
 
     Time complexity: O(1).
     Space complexity: O(1).
     """
+    if device_index < 0 or device_index >= hw_info.device_count:
+        raise ValueError(
+            f"device_index={device_index} is out of range for "
+            f"hw_info.device_count={hw_info.device_count}."
+        )
+
+    if hw_info.device_count > 1 and device_index == 0:
+        logger.warning(
+            "build_hal_for_hardware: %d devices detected but building HAL for "
+            "device_index=0 only. Call this function once per device index "
+            "(0..%d) to utilise all devices.",
+            hw_info.device_count,
+            hw_info.device_count - 1,
+        )
+
     if hw_info.backend == "cuda":
         from zenyx.core.hal.cuda_hal import CudaHAL
+        return CudaHAL(device=device_index)
 
-        return CudaHAL(device=0)
     if hw_info.backend == "rocm":
         from zenyx.core.hal.rocm_hal import RocmHAL
+        return RocmHAL(device_index=device_index)
 
-        return RocmHAL(device_index=0)
     if hw_info.backend == "xla":
         from zenyx.core.hal.xla_hal import XlaHAL
+        return XlaHAL(device_index=device_index)
 
-        return XlaHAL(device_index=0)
     if hw_info.backend == "metal":
         logger.info("Metal backend: using CpuHAL (MPS memory management via PyTorch)")
         from zenyx.core.hal.cpu_hal import CpuHAL
-
         return CpuHAL(t0_capacity_bytes=hw_info.per_device_memory_bytes)
 
     from zenyx.core.hal.cpu_hal import CpuHAL
-
     return CpuHAL(t0_capacity_bytes=hw_info.per_device_memory_bytes)
 
 
