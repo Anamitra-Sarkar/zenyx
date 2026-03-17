@@ -337,6 +337,8 @@ class ParallelismPlanner:
         d_model, n_layers = self._estimate_transformer_dims(model_params)
         n_heads = max(1, d_model // 64)       # Q heads: standard heuristic
         d_head = d_model // n_heads            # head dim
+        # GQA: KV heads = Q heads / 4 — matches LLaMA-2/3, Mistral, Mixtral ratios.
+        # For MHA models (GPT-style), this underestimates; for MQA (1 KV head), it overestimates.
         n_kv_heads = max(1, n_heads // 4)     # GQA: KV heads = Q heads / 4 (common ratio)
 
         kv_bytes = (
