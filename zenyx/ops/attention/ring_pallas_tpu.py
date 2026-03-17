@@ -12,6 +12,18 @@ Complexity
 ----------
 - Time : O(P × S_local² × d)  per ring step, P steps
 - Space: O(S_local × d)  per device
+
+.. note:: Pallas kernel offset constraints
+
+    ``_pallas_kernel_attention`` requires **concrete Python integer** offsets
+    because they are closed over as compile-time constants inside the Pallas
+    kernel body.  This is incompatible with ``lax.scan``, where the step
+    counter is a JAX abstract tracer.
+
+    Inside the ring scan loop, ``_jax_fallback_attention`` is used instead
+    because it builds causal masks via ``jnp.arange + offset`` which works
+    with dynamic JAX arrays.  The Pallas path remains available for direct
+    (non-scanned) single-step calls.
 """
 
 from __future__ import annotations
@@ -85,6 +97,12 @@ def _pallas_local_attention(
 ) -> Tuple[Any, Any]:
     """Local attention using a Pallas kernel (or JAX fallback).
 
+    .. warning::
+        ``q_offset`` and ``kv_offset`` **must be concrete Python integers**.
+        Do NOT call this function inside ``lax.scan`` or ``jax.jit`` with
+        traced (abstract) offset values — use ``_jax_fallback_attention``
+        instead, which accepts dynamic JAX arrays for offsets.
+
     Parameters
     ----------
     q : jnp.ndarray[B, H, S_q, D]
@@ -92,9 +110,9 @@ def _pallas_local_attention(
     v : jnp.ndarray[B, H, S_kv, D]
     causal : bool
     q_offset : int
-        Global sequence offset of Q chunk.
+        Global sequence offset of Q chunk.  Must be a concrete Python int.
     kv_offset : int
-        Global sequence offset of KV chunk.
+        Global sequence offset of KV chunk.  Must be a concrete Python int.
     head_dim : int
         Static head dimension for Pallas BlockSpec compilation.
 
@@ -110,6 +128,13 @@ def _pallas_local_attention(
     """
     _check_jax()
 
+    if not isinstance(q_offset, int) or not isinstance(kv_offset, int):
+        raise RuntimeError(
+            "_pallas_local_attention requires concrete Python integer offsets. "
+            "Inside lax.scan, use _jax_fallback_attention instead, which accepts "
+            "dynamic JAX array offsets."
+        )
+
     if _HAS_PALLAS:
         return _pallas_kernel_attention(q, k, v, causal, q_offset, kv_offset, head_dim=head_dim)
     return _jax_fallback_attention(q, k, v, causal, q_offset, kv_offset)
@@ -124,11 +149,11 @@ def _pallas_kernel_attention(
     Uses ``pallas_call`` to define a custom kernel that computes attention
     with online softmax, mapped over batch and head dimensions.
 
-    Note: ``q_offset`` and ``kv_offset`` are closed-over Python integers
-    treated as compile-time constants by JAX. The compiled kernel is tied
-    to specific offset values. Do not call this function with varying offsets
-    inside ``jax.jit`` without re-tracing, as it will trigger silent
-    recompilation rather than raising an error.
+    ``q_offset`` and ``kv_offset`` are closed-over Python integers treated as
+    compile-time constants by JAX/Pallas. The compiled kernel is tied to
+    specific offset values.  This function must only be called with concrete
+    integer offsets — never inside ``lax.scan`` or other JAX tracing contexts
+    where offsets are abstract values.
 
     TODO(perf): extend GridSpec to cover B×H dims in one kernel launch when
     the target JAX/Pallas GridSpec API is guaranteed across supported versions.
@@ -203,9 +228,13 @@ def _pallas_kernel_attention(
 
 
 def _jax_fallback_attention(
-    q: Any, k: Any, v: Any, causal: bool, q_offset: int, kv_offset: int
+    q: Any, k: Any, v: Any, causal: bool, q_offset: Any, kv_offset: Any
 ) -> Tuple[Any, Any]:
     """Pure-JAX fallback attention when Pallas is unavailable.
+
+    Unlike ``_pallas_kernel_attention``, this function accepts **dynamic
+    JAX arrays** for ``q_offset`` and ``kv_offset`` in addition to concrete
+    Python integers, making it safe to call inside ``lax.scan``.
 
     Complexity
     ----------
@@ -218,6 +247,8 @@ def _jax_fallback_attention(
 
     if causal:
         S_q, S_kv = q.shape[-2], k.shape[-2]
+        # jnp.arange + dynamic offset: works with both concrete ints and
+        # JAX traced arrays, making this safe inside lax.scan.
         q_idx = jnp.arange(S_q) + q_offset
         kv_idx = jnp.arange(S_kv) + kv_offset
         mask = q_idx[:, None] >= kv_idx[None, :]
@@ -269,6 +300,12 @@ class RingFlashAttentionTPU:
     Implements ring attention where KV chunks circulate around the TPU
     ICI ring.  Uses ``jax.experimental.custom_partitioning`` to control
     XLA scheduling and prevent send/recv reordering.
+
+    The ring scan loop uses ``_jax_fallback_attention`` internally because
+    ``lax.scan`` traces the step body with abstract values — the per-step
+    KV offset is a dynamic JAX array, not a concrete Python integer.  The
+    Pallas kernel (``_pallas_kernel_attention``) requires concrete integer
+    offsets and cannot be used inside ``lax.scan``.
 
     Raises ``ImportError`` on construction if JAX is not installed.
 
@@ -337,20 +374,27 @@ class RingFlashAttentionTPU:
         v_cur = v
 
         def ring_step(
-            carry: Tuple[Any, Any, Any, Any, int], _: Any
-        ) -> Tuple[Tuple[Any, Any, Any, Any, int], None]:
-            """One step of the ring: compute + permute."""
+            carry: Tuple[Any, Any, Any, Any, Any], _: Any
+        ) -> Tuple[Tuple[Any, Any, Any, Any, Any], None]:
+            """One step of the ring: compute + permute.
+
+            Offsets are computed as dynamic JAX arrays (rank and step are
+            JAX tracers inside lax.scan). We use _jax_fallback_attention
+            which accepts dynamic array offsets, rather than
+            _pallas_kernel_attention which requires concrete Python ints.
+            """
             output_acc, lse_acc, k_cur, v_cur, step = carry
 
-            # Which rank's KV are we processing?
+            # kv_rank, q_offset, kv_offset are all dynamic JAX arrays here.
+            # rank is a traced lax.axis_index result; step is the scan counter.
             kv_rank = (rank - step) % ring_size
             q_offset = rank * S_local
             kv_offset = kv_rank * S_local
 
-            # Local attention
-            step_output, step_lse = _pallas_local_attention(
+            # Use _jax_fallback_attention: builds causal mask via
+            # jnp.arange + offset, fully compatible with dynamic JAX arrays.
+            step_output, step_lse = _jax_fallback_attention(
                 q, k_cur, v_cur, self._causal, q_offset, kv_offset,
-                head_dim=self._head_dim,
             )
 
             # Online softmax accumulation
@@ -371,7 +415,7 @@ class RingFlashAttentionTPU:
 
             return (output_acc, lse_acc, k_cur, v_cur, step + 1), None
 
-        init_carry = (output_acc, lse_acc, k_cur, v_cur, 0)
+        init_carry = (output_acc, lse_acc, k_cur, v_cur, jnp.zeros((), dtype=jnp.int32))
         (output_acc, lse_acc, _, _, _), _ = lax.scan(
             ring_step, init_carry, None, length=ring_size
         )
@@ -439,12 +483,6 @@ def ring_attention_tpu(
 
     Time complexity:  O(P × S_local² × D) where P = ring size
     Space complexity: O(S_local × H × D)
-
-    Note: ``q_offset`` and ``kv_offset`` used by the internal Pallas kernel are
-    closed-over Python integers treated as compile-time constants by JAX. The
-    compiled kernel is tied to specific offset values. Do not call this function
-    with varying offsets inside ``jax.jit`` without re-tracing, as it will
-    trigger silent recompilation rather than raising an error.
     """
     if not _HAS_JAX:
         raise ImportError(
