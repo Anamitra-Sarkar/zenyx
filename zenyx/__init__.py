@@ -63,29 +63,11 @@ __all__ = [
     "make_offload_remat",
 ]
 
-import importlib.machinery
 import logging
 import os
-import sys
-import types
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 logger = logging.getLogger("zenyx")
-
-# Bootstrap zenyx.train as a namespace package to avoid importing
-# zenyx/train/__init__.py during top-level eager imports.
-_train_pkg = sys.modules.get("zenyx.train")
-if _train_pkg is None:
-    _train_pkg = types.ModuleType("zenyx.train")
-    train_path = str(Path(__file__).resolve().parent / "train")
-    _train_pkg.__path__ = [train_path]  # type: ignore[attr-defined]
-    _train_pkg.__package__ = "zenyx.train"
-    _train_pkg.__spec__ = importlib.machinery.ModuleSpec(
-        name="zenyx.train", loader=None, is_package=True
-    )
-    _train_pkg.__spec__.submodule_search_locations = [train_path]
-    sys.modules["zenyx.train"] = _train_pkg
 
 # ── Phase 4 imports ──────────────────────────────────────────────────────────────────────────
 
