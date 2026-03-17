@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import math
+from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 
 __all__ = [
@@ -34,6 +35,7 @@ __all__ = [
     "compute_skip_schedule_theoretical",
     "compute_skip_schedule",
     "build_hybrid_attention_mask",
+    "HybridAttentionMaskDescriptor",
     "SparseRingAttentionKernel",
     "SKIP_FRACTION_PRODUCTION",
     "SKIP_FRACTION_THEORETICAL",
@@ -215,11 +217,23 @@ def compute_skip_schedule(
 # ---------------------------------------------------------------------------
 
 
+
+
+@dataclass
+class HybridAttentionMaskDescriptor:
+    """Typed descriptor for hybrid local+strided attention mask metadata."""
+
+    window_size: int
+    stride_step: int
+    stride_positions: List[int]
+    num_local_blocks: int
+    num_stride_tokens: int
+    seq_len: int
 def build_hybrid_attention_mask(
     seq_len: int,
     window_size: int = 131_072,
     stride_step: int = 8_192,
-) -> dict:
+) -> HybridAttentionMaskDescriptor:
     """Build hybrid local+strided attention mask descriptor.
 
     Combines:
@@ -244,25 +258,20 @@ def build_hybrid_attention_mask(
 
     Returns
     -------
-    dict
-        Mask descriptor with:
-        - 'window_size': int
-        - 'stride_step': int
-        - 'stride_positions': list[int] — global stride token positions
-        - 'num_local_blocks': int
-        - 'num_stride_tokens': int
+    HybridAttentionMaskDescriptor
+        Typed mask descriptor metadata.
     """
     stride_positions = list(range(0, seq_len, stride_step))
     num_local_blocks = math.ceil(seq_len / window_size)
 
-    mask_desc = {
-        "window_size": window_size,
-        "stride_step": stride_step,
-        "stride_positions": stride_positions,
-        "num_local_blocks": num_local_blocks,
-        "num_stride_tokens": len(stride_positions),
-        "seq_len": seq_len,
-    }
+    mask_desc = HybridAttentionMaskDescriptor(
+        window_size=window_size,
+        stride_step=stride_step,
+        stride_positions=stride_positions,
+        num_local_blocks=num_local_blocks,
+        num_stride_tokens=len(stride_positions),
+        seq_len=seq_len,
+    )
 
     logger.info(
         "Hybrid attention mask: window=%d, stride=%d, %d stride tokens, "
@@ -371,7 +380,7 @@ class SparseRingAttentionKernel:
         return self.ring_degree - sum(self._skip_schedule)
 
     @property
-    def mask_descriptor(self) -> dict:
+    def mask_descriptor(self) -> HybridAttentionMaskDescriptor:
         """Hybrid attention mask descriptor."""
         return self._mask_desc
 

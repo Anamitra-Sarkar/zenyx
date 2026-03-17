@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-__all__ = ["FlashAttentionCPU", "flash_attention_cpu"]
+__all__ = ["flash_attention_cpu"]
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +63,8 @@ class FlashAttentionCPU(nn.Module):
         causal: bool = True,
     ) -> torch.Tensor:
         """Compute scaled dot-product attention on CPU.
+
+        Internal use. For the public API use :func:`flash_attention_cpu`.
 
         Parameters
         ----------
@@ -266,6 +268,8 @@ def flash_attention_cpu(
     chunk_size: int = 512,
 ) -> torch.Tensor:
     """Memory-efficient chunked attention for CPU.
+
+    Canonical public interface: expects tensors in ``(batch, seq, heads, head_dim)``.
 
     Processes attention in chunks of ``chunk_size`` to avoid materialising
     the full ``(seq, seq)`` attention matrix.  ``O(seq × chunk_size)`` memory

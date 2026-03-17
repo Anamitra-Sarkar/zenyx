@@ -124,6 +124,15 @@ def _pallas_kernel_attention(
     Uses ``pallas_call`` to define a custom kernel that computes attention
     with online softmax, mapped over batch and head dimensions.
 
+    Note: ``q_offset`` and ``kv_offset`` are closed-over Python integers
+    treated as compile-time constants by JAX. The compiled kernel is tied
+    to specific offset values. Do not call this function with varying offsets
+    inside ``jax.jit`` without re-tracing, as it will trigger silent
+    recompilation rather than raising an error.
+
+    TODO(perf): extend GridSpec to cover B×H dims in one kernel launch when
+    the target JAX/Pallas GridSpec API is guaranteed across supported versions.
+
     Complexity
     ----------
     Time : O(S_q × S_kv × D)
@@ -182,7 +191,9 @@ def _pallas_kernel_attention(
         out_shape=out_shape,
     )
 
-    # Map over batch and head dims
+    # Map over batch and head dims.
+    # This remains a vmap wrapper for compatibility with current supported
+    # JAX/Pallas APIs; a fused (B, H) GridSpec launch is preferred when stable.
     def per_bh(qbh: Any, kbh: Any, vbh: Any) -> Tuple[Any, Any]:
         return pallas_fn(qbh, kbh, vbh)
 
@@ -428,6 +439,12 @@ def ring_attention_tpu(
 
     Time complexity:  O(P × S_local² × D) where P = ring size
     Space complexity: O(S_local × H × D)
+
+    Note: ``q_offset`` and ``kv_offset`` used by the internal Pallas kernel are
+    closed-over Python integers treated as compile-time constants by JAX. The
+    compiled kernel is tied to specific offset values. Do not call this function
+    with varying offsets inside ``jax.jit`` without re-tracing, as it will
+    trigger silent recompilation rather than raising an error.
     """
     if not _HAS_JAX:
         raise ImportError(

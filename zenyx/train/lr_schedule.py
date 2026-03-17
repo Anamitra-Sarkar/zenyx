@@ -10,12 +10,15 @@ Chinchilla, LLaMA, and GPT-4 recipes.
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import List
 
 import torch
 
 __all__ = ["CosineWithWarmup"]
+
+logger = logging.getLogger(__name__)
 
 
 class CosineWithWarmup:
@@ -55,6 +58,7 @@ class CosineWithWarmup:
         self._total_steps = total_steps
         self._min_lr = peak_lr * min_lr_ratio
         self._step: int = 0
+        self._warned_past_total: bool = False
 
     def step(self) -> float:
         """Advance one step and update optimizer LR. Returns current LR."""
@@ -78,6 +82,8 @@ class CosineWithWarmup:
         Warmup: lr = peak_lr * (step / warmup_steps)
         Cosine: lr = min_lr + 0.5 * (peak_lr - min_lr) * (1 + cos(π * progress))
         where progress = (step - warmup_steps) / (total_steps - warmup_steps)
+
+        After `total_steps`, LR remains at `min_lr` indefinitely.
         """
         if step <= 0:
             return 0.0
@@ -89,6 +95,15 @@ class CosineWithWarmup:
             return self._peak_lr
 
         decay_steps = self._total_steps - self._warmup_steps
+        if step > self._total_steps and not self._warned_past_total:
+            logger.warning(
+                "CosineWithWarmup: step %d exceeds total_steps %d. LR is clamped to "
+                "min_lr=%.2e. Did you mean to extend the schedule?",
+                step,
+                self._total_steps,
+                self._min_lr,
+            )
+            self._warned_past_total = True
         progress = min((step - self._warmup_steps) / decay_steps, 1.0)
         return self._min_lr + 0.5 * (self._peak_lr - self._min_lr) * (
             1.0 + math.cos(math.pi * progress)
@@ -106,6 +121,7 @@ class CosineWithWarmup:
             "total_steps": self._total_steps,
             "min_lr": self._min_lr,
             "step": self._step,
+            "warned_past_total": self._warned_past_total,
         }
 
     def load_state_dict(self, state: dict) -> None:
@@ -119,6 +135,7 @@ class CosineWithWarmup:
         self._total_steps = state["total_steps"]
         self._min_lr = state["min_lr"]
         self._step = state["step"]
+        self._warned_past_total = state.get("warned_past_total", False)
         # Apply the correct LR to the optimizer.
         lr = self._compute_lr(self._step)
         for param_group in self._optimizer.param_groups:

@@ -98,17 +98,26 @@ class ZenyxGradScaler:
             self._scaler.step(optimizer)
             return
 
-        # Manual path: check for inf/nan in gradients
+        # Manual path:
+        # 1) ensure gradients are fully unscaled exactly once
+        # 2) scan for inf/nan
+        # 3) step only if finite
         self._found_inf = False
+
+        if not self._unscaled:
+            for group in optimizer.param_groups:
+                for p in group["params"]:
+                    if p.grad is not None:
+                        p.grad.div_(self._scale)
+            self._unscaled = True
+
         for group in optimizer.param_groups:
             for p in group["params"]:
-                if p.grad is not None:
-                    if torch.isinf(p.grad).any() or torch.isnan(p.grad).any():
-                        self._found_inf = True
-                        break
-                    # Only unscale if unscale_() was not already called this step.
-                    if not self._unscaled:
-                        p.grad.div_(self._scale)
+                if p.grad is not None and (
+                    torch.isinf(p.grad).any() or torch.isnan(p.grad).any()
+                ):
+                    self._found_inf = True
+                    break
             if self._found_inf:
                 break
 
@@ -182,3 +191,32 @@ class ZenyxGradScaler:
             f"ZenyxGradScaler(scale={self.get_scale():.1f}, "
             f"enabled={self._enabled}, backend={backend})"
         )
+
+    def state_dict(self) -> dict:
+        """Return serializable scaler state."""
+        if self._scaler is not None:
+            return self._scaler.state_dict()
+        return {
+            "enabled": self._enabled,
+            "scale": self._scale,
+            "growth_factor": self._growth_factor,
+            "backoff_factor": self._backoff_factor,
+            "growth_interval": self._growth_interval,
+            "growth_tracker": self._growth_tracker,
+            "found_inf": self._found_inf,
+            "unscaled": self._unscaled,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore scaler state from :meth:`state_dict`."""
+        if self._scaler is not None:
+            self._scaler.load_state_dict(state)
+            return
+        self._enabled = state.get("enabled", self._enabled)
+        self._scale = state.get("scale", self._scale)
+        self._growth_factor = state.get("growth_factor", self._growth_factor)
+        self._backoff_factor = state.get("backoff_factor", self._backoff_factor)
+        self._growth_interval = state.get("growth_interval", self._growth_interval)
+        self._growth_tracker = state.get("growth_tracker", self._growth_tracker)
+        self._found_inf = state.get("found_inf", self._found_inf)
+        self._unscaled = state.get("unscaled", self._unscaled)

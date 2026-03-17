@@ -66,9 +66,12 @@ logger = logging.getLogger("zenyx.core.allocator.feasibility")
 # Reference: Kaplan et al. 2020, Korthikanti et al. 2022.
 _TRANSFORMER_FLOP_PER_BYTE: float = 16.0
 
-# Pipeline prefetch depth: the eviction pipeline can run this many steps
-# ahead of compute.  The OOM-free condition is satisfied when:
-#   F_compute ≤ _PIPELINE_DEPTH × max(B_01, B_12)
+# Pipeline prefetch depth used by the formal feasibility bound.
+# This constant matches TierAllocator prefetch lookahead assumptions in the
+# allocator design docs (historically a 100-step asynchronous horizon):
+#   F_compute ≤ depth × max(B_01, B_12)
+# Keep this in sync with TierAllocator prefetch-horizon tuning so the
+# guarantee remains calibrated to runtime prefetch behavior.
 _PIPELINE_DEPTH: int = 100
 
 
