@@ -1,16 +1,6 @@
-import importlib.util
-import sys
-from pathlib import Path
-
 import torch
 
-_module_path = Path(__file__).resolve().parents[1] / 'zenyx/train/lr_schedule.py'
-_spec = importlib.util.spec_from_file_location('lr_schedule_module', _module_path)
-_mod = importlib.util.module_from_spec(_spec)
-assert _spec and _spec.loader
-sys.modules[_spec.name] = _mod
-_spec.loader.exec_module(_mod)
-CosineWithWarmup = _mod.CosineWithWarmup
+from zenyx.train.lr_schedule import CosineWithWarmup
 
 
 def _make_sched():
@@ -51,3 +41,23 @@ def test_post_total_steps_clamps_to_min_lr():
     for _ in range(1100):
         lr = sched.step()
     assert abs(lr - 1e-4) < 1e-12
+
+
+def test_lr_never_negative():
+    sched, _ = _make_sched()
+    lrs = []
+    for _ in range(1100):
+        lrs.append(sched.step())
+    assert all(lr >= 0.0 for lr in lrs)
+
+
+def test_state_dict_has_required_keys():
+    sched, _ = _make_sched()
+    state = sched.state_dict()
+    for key in ("peak_lr", "warmup_steps", "total_steps", "min_lr", "step"):
+        assert key in state
+
+
+def test_repr_contains_class_name():
+    sched, _ = _make_sched()
+    assert "CosineWithWarmup" in repr(sched)

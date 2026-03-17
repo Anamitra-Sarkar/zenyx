@@ -1,18 +1,22 @@
-import importlib.util
-import sys
 import math
-from pathlib import Path
 
-_module_path = Path(__file__).resolve().parents[1] / 'zenyx/core/allocator/feasibility.py'
-_spec = importlib.util.spec_from_file_location('feasibility_module', _module_path)
-_mod = importlib.util.module_from_spec(_spec)
-assert _spec and _spec.loader
-sys.modules[_spec.name] = _mod
-_spec.loader.exec_module(_mod)
+import pytest
 
-check_feasibility = _mod.check_feasibility
-compute_throughput_from_hardware = _mod.compute_throughput_from_hardware
-estimate_memory_budget = _mod.estimate_memory_budget
+from zenyx.core.allocator.feasibility import (
+    check_feasibility,
+    compute_throughput_from_hardware,
+    estimate_memory_budget,
+)
+
+_H100_HBM_BW = 3.35e12
+_H100_NVME_BW = 14e9
+_H100_TFLOPS_BF16 = 3958.0
+_A100_HBM_BW = 2.0e12
+_A100_NVME_BW = 7.5e9
+_A100_TFLOPS_BF16 = 312.0
+_TOY_BW = 10e9
+_TOY_TFLOPS = 989.0
+_FLOP_PER_BYTE = 16.0
 
 
 def test_compute_throughput_from_hardware_known_value():
@@ -64,3 +68,96 @@ def test_estimate_memory_budget_legacy_fallback_warns(caplog):
         n_kv_heads=4,
     )
     assert "without micro_bs/seq_len/d_ff" in caplog.text
+
+
+def test_h100_is_feasible():
+    result = check_feasibility(
+        bandwidth_t0_t1=_H100_HBM_BW,
+        bandwidth_t1_t2=_H100_NVME_BW,
+        compute_throughput=compute_throughput_from_hardware(
+            _H100_TFLOPS_BF16,
+            _FLOP_PER_BYTE,
+        ),
+    )
+    assert result.is_feasible is True
+    assert result.margin <= 0.0
+
+
+def test_a100_is_feasible():
+    result = check_feasibility(
+        bandwidth_t0_t1=_A100_HBM_BW,
+        bandwidth_t1_t2=_A100_NVME_BW,
+        compute_throughput=compute_throughput_from_hardware(
+            _A100_TFLOPS_BF16,
+            _FLOP_PER_BYTE,
+        ),
+    )
+    assert result.is_feasible is True
+    assert result.margin <= 0.0
+
+
+def test_toy_bottleneck_is_infeasible():
+    result = check_feasibility(
+        bandwidth_t0_t1=_TOY_BW,
+        bandwidth_t1_t2=_TOY_BW,
+        compute_throughput=compute_throughput_from_hardware(
+            _TOY_TFLOPS,
+            _FLOP_PER_BYTE,
+        ),
+    )
+    assert result.is_feasible is False
+    assert result.margin > 0.0
+
+
+def test_feasible_has_negative_margin():
+    result = check_feasibility(
+        bandwidth_t0_t1=_H100_HBM_BW,
+        bandwidth_t1_t2=_H100_NVME_BW,
+        compute_throughput=compute_throughput_from_hardware(
+            _H100_TFLOPS_BF16,
+            _FLOP_PER_BYTE,
+        ),
+    )
+    assert result.margin < 0.0
+
+
+def test_infeasible_has_positive_margin():
+    result = check_feasibility(
+        bandwidth_t0_t1=_TOY_BW,
+        bandwidth_t1_t2=_TOY_BW,
+        compute_throughput=compute_throughput_from_hardware(
+            _TOY_TFLOPS,
+            _FLOP_PER_BYTE,
+        ),
+    )
+    assert result.margin > 0.0
+
+
+def test_zero_b01_raises():
+    with pytest.raises(ValueError):
+        check_feasibility(0.0, 1e9, 1e10)
+
+
+def test_zero_b12_raises():
+    with pytest.raises(ValueError):
+        check_feasibility(1e12, 0.0, 1e10)
+
+
+def test_zero_compute_raises():
+    with pytest.raises(ValueError):
+        check_feasibility(1e12, 1e9, 0.0)
+
+
+def test_negative_b01_raises():
+    with pytest.raises(ValueError):
+        check_feasibility(-1.0, 1e9, 1e10)
+
+
+def test_compute_throughput_raises_on_zero_tflops():
+    with pytest.raises(ValueError):
+        compute_throughput_from_hardware(0.0)
+
+
+def test_compute_throughput_raises_on_negative_flop_per_byte():
+    with pytest.raises(ValueError):
+        compute_throughput_from_hardware(100.0, flop_per_byte=-1.0)

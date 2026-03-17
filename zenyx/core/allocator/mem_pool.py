@@ -223,10 +223,12 @@ class MemoryPool:
 
                 if tier == MemTier.T0 and self._copy_in_progress > 0:
                     logger.debug(
-                        "Delaying T0 allocation reuse while %d eviction copies in progress",
+                        "Skipping T0 allocation: %d eviction copies in progress",
                         self._copy_in_progress,
                     )
-                elif state.free >= aligned:
+                    continue
+
+                if state.free >= aligned:
                     return self._do_alloc(aligned, tier)
 
                 if tier != MemTier.T2:
