@@ -146,13 +146,25 @@ if _HAS_TRITON:
                 valid_mask = valid_mask & causal_mask
             s = tl.where(valid_mask, s, float("-inf"))
 
-            # Online softmax update
+            # Online softmax update (FlashAttention-2 recurrence):
+            #   m_new = max(m_i, m_ij)            -- new running max
+            #   alpha = exp(m_i   - m_new)        -- rescale old accumulator
+            #   beta  = exp(m_ij  - m_new)        -- rescale this block's sum
+            #   l_i   = l_i * alpha + beta * sum_j exp(s_j - m_ij)
+            #   o_i   = o_i * alpha + beta * (P @ V)  where P = exp(s - m_ij)
+            #
+            # Computing exp(s - m_ij) instead of exp(s - m_new) keeps values
+            # in [0, 1] relative to this block's maximum, then beta rescales
+            # them into the global running frame.  Using m_new directly would
+            # only be correct when beta == 1, i.e. m_ij == m_new, which holds
+            # only on the very first KV block.
             m_ij = tl.max(s, axis=1)
             m_new = tl.maximum(m_i, m_ij)
             alpha = tl.exp(m_i - m_new)
             beta = tl.exp(m_ij - m_new)
 
-            l_i = l_i * alpha + tl.sum(tl.exp(s - m_new[:, None]), axis=1)
+            # Accumulate l_i using beta (fix: was missing beta factor)
+            l_i = l_i * alpha + beta * tl.sum(tl.exp(s - m_ij[:, None]), axis=1)
             o_i = o_i * alpha[:, None]
 
             # Load V block: [BLOCK_S, D]
@@ -165,10 +177,11 @@ if _HAS_TRITON:
             )
             v = tl.load(v_ptrs, mask=k_mask, other=0.0)
 
-            # P @ V  (where P = softmax weights)
-            p = tl.exp(s - m_new[:, None])
+            # P @ V  (where P = softmax weights relative to block max m_ij)
+            p = tl.exp(s - m_ij[:, None])
             p = tl.where(valid_mask, p, 0.0)
-            o_i += tl.dot(p.to(v.dtype), v)
+            # beta rescales p into the global running frame before accumulating
+            o_i += beta[:, None] * tl.dot(p.to(v.dtype), v)
 
             m_i = m_new
 
