@@ -359,7 +359,18 @@ class MemoryPool:
                 # holding the allocator lock over HAL I/O. To minimize reuse
                 # races, T0 allocations are temporarily delayed while copies are
                 # in flight (guarded by _copy_in_progress).
-                assert self._evict_depth == 1
+                #
+                # Invariant: we only release the lock at depth==1 (the outermost
+                # eviction call). Recursive calls (depth>1) do their copies
+                # inline in the else branch below. This check is belt-and-
+                # suspenders — the enclosing `if` already guarantees depth==1,
+                # but we raise explicitly so the check survives -O optimisation.
+                if self._evict_depth != 1:
+                    raise RuntimeError(
+                        f"_evict_until invariant violated: expected evict_depth=1, "
+                        f"got {self._evict_depth}. This is an internal bug in "
+                        f"MemoryPool._evict_until — please file an issue."
+                    )
                 self._copy_in_progress += 1
                 self._lock.release()
                 try:
