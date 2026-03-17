@@ -275,6 +275,16 @@ class RingCurriculumManager:
 
         self._schedule = curriculum_schedule or list(_DEFAULT_CURRICULUM)
         self._current_stage: int = 0
+
+        # Validate schedule divisibility at init time so bad schedules fail fast.
+        for stage_idx, (seq_len, ring_deg) in enumerate(self._schedule):
+            if ring_deg <= 0:
+                raise ValueError(f"Stage {stage_idx}: ring_degree must be positive, got {ring_deg}")
+            if seq_len % ring_deg != 0:
+                raise ValueError(
+                    f"Stage {stage_idx}: seq_len={seq_len} is not divisible by ring_degree={ring_deg}. "
+                    "All curriculum stages must have seq_len divisible by ring_degree for even token sharding."
+                )
         self._reshard_count: int = 0
         self._reshard_times_ms: List[float] = []
 
@@ -371,9 +381,9 @@ class RingCurriculumManager:
             return False
 
         recent = loss_history[-self.convergence_window:]
-        loss_delta = abs(recent[-1] - recent[0])
+        loss_range = max(recent) - min(recent)
 
-        return loss_delta < self.convergence_threshold
+        return loss_range < self.convergence_threshold
 
     def advance_stage(self, device_id: int = 0) -> Dict[str, Any]:
         """Advance to the next curriculum stage.

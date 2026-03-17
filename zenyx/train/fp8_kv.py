@@ -310,6 +310,8 @@ class _STEQuantizeFunction(torch.autograd.Function):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         k_fp8, v_fp8, k_scales, v_scales = quantize_kv_fp8(k, v, strategy)
         k_deq, v_deq = dequantize_kv(k_fp8, v_fp8, k_scales, v_scales, strategy)
+        ctx.save_for_backward(k_scales, v_scales)  # save for potential future use
+        ctx.strategy = strategy
         return k_deq, v_deq
 
     @staticmethod

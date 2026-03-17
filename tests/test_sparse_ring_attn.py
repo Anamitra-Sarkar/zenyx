@@ -78,6 +78,12 @@ def test_device0_block_always_active(device_id: int):
 
 
 def test_load_count_matches_active_steps():
+    """execute_step() raises NotImplementedError for active (non-skipped) steps.
+
+    With Fix 2, execute_step() raises NotImplementedError instead of returning
+    a sentinel dict, because the Pallas kernel is not yet implemented.
+    Skipped steps still return None.
+    """
     kernel = SparseRingAttentionKernel(
         ring_degree=8,
         window_size=131_072,
@@ -86,14 +92,24 @@ def test_load_count_matches_active_steps():
         skip_mode="production",
         device_id=3,
     )
+    skip_count = 0
+    error_count = 0
     for step in range(8):
-        kernel.execute_step(step)
+        if not kernel.should_load_kv(step):
+            result = kernel.execute_step(step)
+            assert result is None
+            skip_count += 1
+        else:
+            with pytest.raises(NotImplementedError, match="execute_step"):
+                kernel.execute_step(step)
+            error_count += 1
 
-    assert kernel.get_load_count() == 3
-    assert kernel.get_skip_count() == 5
+    assert skip_count == 5
+    assert error_count == 3
 
 
 def test_execute_returns_none_for_skipped():
+    """execute_step() returns None for skipped steps, raises NotImplementedError for active steps."""
     kernel = SparseRingAttentionKernel(
         ring_degree=8,
         window_size=131_072,
@@ -103,11 +119,11 @@ def test_execute_returns_none_for_skipped():
         device_id=3,
     )
     for step in range(8):
-        out = kernel.execute_step(step)
         if kernel.should_load_kv(step):
-            assert out is not None
-            assert out["executed"] is True
+            with pytest.raises(NotImplementedError):
+                kernel.execute_step(step)
         else:
+            out = kernel.execute_step(step)
             assert out is None
 
 
@@ -126,8 +142,19 @@ def test_insufficient_depth_fails():
 
 
 def test_ring_degree_must_match_world_size():
-    with pytest.raises(ValueError, match="ring_degree must equal world_size"):
-        SparseRingAttentionKernel(ring_degree=4, world_size=8)
+    """ring_degree=4 with world_size=8 is now valid (8 % 4 == 0).
+
+    With Fix 10, the hard equality constraint (ring_degree == world_size) is
+    relaxed to a divisibility check, allowing combined TP+PP+Ring configurations
+    like ring_degree=4, world_size=8.
+    """
+    # This should now succeed since 8 % 4 == 0
+    kernel = SparseRingAttentionKernel(ring_degree=4, world_size=8)
+    assert kernel is not None
+
+    # Indivisible case must still raise
+    with pytest.raises(ValueError, match="divisible"):
+        SparseRingAttentionKernel(ring_degree=3, world_size=8)
 
 
 def test_stride_positions_are_correct():

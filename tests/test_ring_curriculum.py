@@ -134,13 +134,17 @@ class TestStageAdvancement:
         assert not torch.equal(keys_0, keys_1)
 
     def test_prng_keys_requires_even_division(self) -> None:
-        """active_seq_len must divide evenly by ring_degree."""
+        """active_seq_len must divide evenly by ring_degree.
+
+        With Fix 9, the divisibility check now happens at __init__ time rather
+        than when get_prng_keys() is called, so the ValueError is raised on
+        construction with a bad schedule.
+        """
         schedule = [(1001, 2)]
-        mgr = RingCurriculumManager(
-            max_seq_len=1001, world_size=2, curriculum_schedule=schedule
-        )
         with pytest.raises(ValueError, match="divisible"):
-            mgr.get_prng_keys(device_id=0)
+            RingCurriculumManager(
+                max_seq_len=1001, world_size=2, curriculum_schedule=schedule
+            )
 
     def test_optimizer_state_not_resharded(self) -> None:
         """Verify optimizer state is NOT part of the reshard operation.

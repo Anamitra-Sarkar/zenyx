@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import math
+import warnings
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 
@@ -341,11 +342,15 @@ class SparseRingAttentionKernel:
         self.num_layers = num_layers
         self.device_id = device_id
 
-        # FIX: Sparse ring attention assumes one ring step per device.
-        if ring_degree != world_size:
+        # FIX: Allow combined TP+PP+Ring configurations by relaxing to divisibility check.
+        if ring_degree > world_size:
             raise ValueError(
-                f"ring_degree must equal world_size for sparse ring attention "
-                f"(got ring_degree={ring_degree}, world_size={world_size})."
+                f"ring_degree ({ring_degree}) cannot exceed world_size ({world_size})."
+            )
+        if world_size % ring_degree != 0:
+            raise ValueError(
+                f"world_size ({world_size}) must be divisible by ring_degree ({ring_degree}) "
+                "for even ring group assignment."
             )
 
         # Depth check for universal approximation guarantee.
@@ -380,6 +385,13 @@ class SparseRingAttentionKernel:
             "active_steps=%d, head_dim=%d",
             skip_mode, skip_fraction,
             ring_degree - sum(self._skip_schedule), head_dim,
+        )
+
+        warnings.warn(
+            "SparseRingAttentionKernel is initialised but execute_step() is not implemented. "
+            "The model will use dense attention. Set sparse_attn=False to suppress this warning.",
+            UserWarning,
+            stacklevel=2,
         )
 
     @property
@@ -429,11 +441,11 @@ class SparseRingAttentionKernel:
             return None  # Skip — no HBM load, no kernel
 
         self._load_count += 1
-        # In production, this would call the Pallas kernel with:
-        # - scalar_prefetch API to conditionally load SRAM blocks
-        # - fused FP8 dequant + attention
-        # For testing, we return a sentinel indicating execution
-        return {"step": step, "executed": True}
+        raise NotImplementedError(
+            "SparseRingAttentionKernel.execute_step() is not yet implemented. "
+            "The Pallas kernel integration is pending. "
+            "Set sparse_attn=False to use dense ring attention."
+        )
 
     def get_load_count(self) -> int:
         """Number of actual HBM loads performed."""

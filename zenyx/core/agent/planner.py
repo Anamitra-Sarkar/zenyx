@@ -260,16 +260,7 @@ class ParallelismPlanner:
         if model_params > 0 and context_len > 0:
             new_plan = self.plan(model_params, vocab_size, context_len, batch_size)
         elif self._last_plan is not None:
-            new_plan = ParallelismPlan(
-                tp_degree=self._last_plan.tp_degree,
-                pp_degree=self._last_plan.pp_degree,
-                dp_degree=self._last_plan.dp_degree,
-                ring_degree=self._last_plan.ring_degree,
-                schedule_type=self._last_plan.schedule_type,
-                estimated_bubble_fraction=self._last_plan.estimated_bubble_fraction,
-                estimated_tokens_per_sec=self._last_plan.estimated_tokens_per_sec,
-                memory_per_device_gb=self._last_plan.memory_per_device_gb,
-            )
+            new_plan = replace(self._last_plan)  # shallow copy via dataclasses.replace
         else:
             new_plan = ParallelismPlan()
 
@@ -277,18 +268,20 @@ class ParallelismPlanner:
         if total_compute_ms > 0 and total_comm_ms > 0:
             comm_ratio = total_comm_ms / (total_compute_ms + total_comm_ms)
             if comm_ratio > 0.3 and new_plan.tp_degree > 1:
-                # Communication-bound: reduce TP, increase DP
-                new_plan = replace(
-                    new_plan,
-                    tp_degree=max(1, new_plan.tp_degree // 2),
-                    dp_degree=new_plan.dp_degree * 2,
-                )
-                logger.info(
-                    "Replan: comm overhead %.1f%% — reducing TP to %d, increasing DP to %d",
-                    comm_ratio * 100,
-                    new_plan.tp_degree,
-                    new_plan.dp_degree,
-                )
+                # Communication-bound: reduce TP, increase DP — check feasibility first
+                proposed_tp = max(1, new_plan.tp_degree // 2)
+                proposed_dp = new_plan.dp_degree * 2
+                if proposed_tp * new_plan.pp_degree * proposed_dp * new_plan.ring_degree <= self._hw.device_count:
+                    new_plan = replace(new_plan, tp_degree=proposed_tp, dp_degree=proposed_dp)
+                    logger.info(
+                        "Replan: comm overhead %.1f%% — reducing TP to %d, increasing DP to %d",
+                        comm_ratio * 100, proposed_tp, proposed_dp,
+                    )
+                else:
+                    logger.info(
+                        "Replan: comm overhead %.1f%% — TP/DP swap not feasible with %d devices, skipping.",
+                        comm_ratio * 100, self._hw.device_count,
+                    )
             elif comm_ratio < 0.1 and new_plan.dp_degree > 1:
                 # Compute-bound with room: increase TP for faster per-op execution
                 max_tp = min(
@@ -297,16 +290,19 @@ class ParallelismPlanner:
                     self._hw.device_count,
                 )
                 if max_tp > new_plan.tp_degree:
-                    new_plan = replace(
-                        new_plan,
-                        dp_degree=max(1, new_plan.dp_degree // 2),
-                        tp_degree=max_tp,
-                    )
-                    logger.info(
-                        "Replan: compute-bound (comm %.1f%%) — increasing TP to %d",
-                        comm_ratio * 100,
-                        new_plan.tp_degree,
-                    )
+                    proposed_dp = max(1, new_plan.dp_degree // 2)
+                    proposed_tp = max_tp
+                    if proposed_tp * new_plan.pp_degree * proposed_dp * new_plan.ring_degree <= self._hw.device_count:
+                        new_plan = replace(new_plan, dp_degree=proposed_dp, tp_degree=proposed_tp)
+                        logger.info(
+                            "Replan: compute-bound (comm %.1f%%) — increasing TP to %d",
+                            comm_ratio * 100, proposed_tp,
+                        )
+                    else:
+                        logger.info(
+                            "Replan: compute-bound (comm %.1f%%) — TP increase not feasible with %d devices, skipping.",
+                            comm_ratio * 100, self._hw.device_count,
+                        )
 
         # FIX: Ensure tp × pp × dp × ring never exceeds total devices.
         new_plan = self._clamp_plan_to_devices(new_plan, self._hw.device_count)
@@ -339,9 +335,9 @@ class ParallelismPlanner:
         """
         # FIX: Estimate architecture from params using anchored heuristics.
         d_model, n_layers = self._estimate_transformer_dims(model_params)
-        n_kv_heads = max(1, d_model // 128)  # GQA heuristic
-        n_heads_estimate = max(1, d_model // 64)
-        d_head = d_model // n_heads_estimate
+        n_heads = max(1, d_model // 64)       # Q heads: standard heuristic
+        d_head = d_model // n_heads            # head dim
+        n_kv_heads = max(1, n_heads // 4)     # GQA: KV heads = Q heads / 4 (common ratio)
 
         kv_bytes = (
             2  # K + V
