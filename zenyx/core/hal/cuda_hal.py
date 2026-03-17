@@ -305,6 +305,12 @@ class CudaHAL(HALBase):
     def free(self, block: MemBlock) -> None:
         """Release *block* back to its tier pool.
 
+        Uses ``block.data = None`` rather than ``del block.data`` so that
+        the tensor's Python refcount is decremented correctly.  ``del``
+        removes the attribute but does not guarantee the refcount reaches
+        zero if other references exist (e.g. a live CUDA stream op);
+        assigning ``None`` is the correct idiom for nulling a dataclass slot.
+
         Args:
             block: Previously allocated :class:`MemBlock`.
 
@@ -315,13 +321,15 @@ class CudaHAL(HALBase):
             if block.tier == MemTier.T0:
                 self._t0_blocks.pop(block.block_id, None)
                 self._t0_allocated = max(0, self._t0_allocated - block.size_bytes)
-                # Let PyTorch's caching allocator reclaim the memory.
-                del block.data
+                # Set to None rather than del: decrements refcount correctly,
+                # allowing the CUDA caching allocator to reclaim the memory
+                # once all other references (e.g. stream ops) also drop.
+                block.data = None
 
             elif block.tier == MemTier.T1:
                 self._t1_blocks.pop(block.block_id, None)
                 self._t1_allocated = max(0, self._t1_allocated - block.size_bytes)
-                del block.data
+                block.data = None
 
             elif block.tier == MemTier.T2:
                 t2f = self._t2_files.pop(block.block_id, None)
