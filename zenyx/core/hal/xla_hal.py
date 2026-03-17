@@ -32,6 +32,13 @@ from zenyx.core.hal.base import HALBase, MemBlock, MemTier, ReduceOp, _human_byt
 
 logger = logging.getLogger("zenyx.core.hal.xla_hal")
 
+# TPU memory defaults (GiB) by generation (approximate).
+_TPU_MEM_GB = {
+    "v4": 32,
+    "v5e": 16,
+    "v5p": 32,
+}
+
 # ── Optional JAX imports ──────────────────────────────────────────────────
 
 _JAX_AVAILABLE = False
@@ -96,8 +103,16 @@ class XlaHAL(HALBase):
                 self._device = devices[device_index]
             else:
                 self._device = devices[0] if devices else None
-            # TPU v5e has 16 GB HBM; v4 has 32 GB; assume 16 GB default
-            self._t0_total = 16 * (1 << 30)
+            # FIX: Set HBM size based on TPU generation when device_kind is available.
+            kind = str(getattr(self._device, "device_kind", "")).lower() if self._device else ""
+            if "v5p" in kind:
+                self._t0_total = _TPU_MEM_GB["v5p"] * (1 << 30)
+            elif "v5e" in kind:
+                self._t0_total = _TPU_MEM_GB["v5e"] * (1 << 30)
+            elif "v4" in kind:
+                self._t0_total = _TPU_MEM_GB["v4"] * (1 << 30)
+            else:
+                self._t0_total = _TPU_MEM_GB["v5e"] * (1 << 30)
             logger.info("XlaHAL: using device %s", self._device)
 
         self._t0_used: int = 0

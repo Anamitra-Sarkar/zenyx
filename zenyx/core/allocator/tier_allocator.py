@@ -37,6 +37,7 @@ from typing import Any, Optional
 
 from zenyx.core.allocator.reuse_heap import ComputeGraph, Op, ReuseHeap
 from zenyx.core.hal.base import MemBlock, MemTier
+from zenyx.core.allocator.constants import PIPELINE_DEPTH_STEPS
 
 _MemoryPool: Optional[type] = None
 
@@ -154,7 +155,8 @@ class TierAllocator:
 
         self._graph: Optional[ComputeGraph] = None
         self._current_op_idx: int = 0
-        self.prefetch_window: int = 3
+        # FIX: Share the pipeline prefetch horizon with feasibility checks.
+        self.prefetch_window: int = PIPELINE_DEPTH_STEPS
 
         self._blocks: dict[int, MemBlock] = {}
 

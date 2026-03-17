@@ -350,7 +350,9 @@ class ModelLoader:
 
         Time: O(M).  Space: O(M).
         """
-        assert self._executor is not None
+        if self._executor is None:
+            # FIX: Avoid assert for runtime validation in async loader path.
+            raise RuntimeError("ModelLoader executor is not initialised.")
         future: Future[Dict[str, Any]] = self._executor.submit(
             torch.load, path, map_location="cpu", weights_only=True,
         )
@@ -446,7 +448,9 @@ class ModelLoader:
 
                 if cuda_available:
                     pinned = tensor.pin_memory()
-                    assert slot.stream is not None
+                    if slot.stream is None:
+                        # FIX: Avoid assert for runtime validation in CUDA stream setup.
+                        raise RuntimeError("CUDA stream was not initialised for buffer slot.")
                     with torch.cuda.stream(slot.stream):
                         gpu_tensor = pinned.to(
                             self._device, non_blocking=True,

@@ -128,7 +128,9 @@ class FP8ActivationStorage:
         )
 
         if self._use_native:
-            assert _NATIVE_FP8_DTYPE is not None
+            if _NATIVE_FP8_DTYPE is None:
+                # FIX: Avoid assert for runtime validation when native FP8 is expected.
+                raise RuntimeError("Native FP8 dtype is unavailable but native path was selected.")
             quantized = (tensor.float() * scale).to(_NATIVE_FP8_DTYPE)
         else:
             # Software fallback: scale into [-448, 448], clamp, round, store
@@ -322,7 +324,9 @@ class _FP8CheckpointWrapper(nn.Module):
         Same as wrapped module + *O(n)* quantisation overhead.
         """
         outs = FP8CheckpointFunction.apply(self.module, self.storage, *inputs)
-        assert outs is not None
+        if outs is None:
+            # FIX: Avoid assert for runtime validation on autograd outputs.
+            raise RuntimeError("FP8CheckpointFunction returned None outputs.")
         if len(outs) == 1:
             return outs[0]
         return outs  # type: ignore[return-value]
@@ -350,7 +354,7 @@ def fp8_checkpoint(
     module : nn.Module
         Top-level module whose children will be selectively wrapped.
     every_n : int, optional
-        Checkpoint every *N*-th child (default 4).
+        Checkpoint every *N*-th child starting at index 0 (default 4).
     force_simulated : bool, optional
         Force the software FP8 fallback.
     _int8 : bool, optional
@@ -367,6 +371,7 @@ def fp8_checkpoint(
     ----------
     Time *O(L)* where *L* = number of children.
     """
+    # FIX: Document index-0 wrapping behavior for fp8_checkpoint.
     if _int8:
         _warn_int8()
 

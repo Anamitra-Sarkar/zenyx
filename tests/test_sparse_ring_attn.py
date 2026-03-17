@@ -46,7 +46,7 @@ def test_sparse_kernel_depth_assertion_fires():
     seq_len = 4096
     window_size = 1024
     min_depth = math.ceil(seq_len / window_size)
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError):
         SparseRingAttentionKernel(
             ring_degree=8,
             window_size=window_size,
@@ -121,8 +121,13 @@ def test_exact_minimum_depth_passes():
 
 
 def test_insufficient_depth_fails():
-    with pytest.raises(AssertionError, match="too shallow"):
+    with pytest.raises(ValueError, match="too shallow"):
         SparseRingAttentionKernel(num_layers=2, seq_len=1_000_000, window_size=131_072)
+
+
+def test_ring_degree_must_match_world_size():
+    with pytest.raises(ValueError, match="ring_degree must equal world_size"):
+        SparseRingAttentionKernel(ring_degree=4, world_size=8)
 
 
 def test_stride_positions_are_correct():

@@ -534,6 +534,10 @@ def _legacy_train(
 
         step += 1
 
+        if checkpointer is not None:
+            # FIX: Surface async checkpoint errors promptly during training.
+            checkpointer.poll()
+
         # Periodic checkpoint.
         if (
             checkpointer is not None

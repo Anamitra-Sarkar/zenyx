@@ -59,6 +59,8 @@ import math
 from dataclasses import dataclass
 from typing import Optional
 
+from zenyx.core.allocator.constants import PIPELINE_DEPTH_STEPS
+
 logger = logging.getLogger("zenyx.core.allocator.feasibility")
 
 # Arithmetic intensity of a typical transformer layer in BF16:
@@ -67,12 +69,7 @@ logger = logging.getLogger("zenyx.core.allocator.feasibility")
 _TRANSFORMER_FLOP_PER_BYTE: float = 16.0
 
 # Pipeline prefetch depth used by the formal feasibility bound.
-# This constant matches TierAllocator prefetch lookahead assumptions in the
-# allocator design docs (historically a 100-step asynchronous horizon):
-#   F_compute ≤ depth × max(B_01, B_12)
-# Keep this in sync with TierAllocator prefetch-horizon tuning so the
-# guarantee remains calibrated to runtime prefetch behavior.
-_PIPELINE_DEPTH: int = 100
+# FIX: Keep this constant shared with TierAllocator so the bound matches runtime behavior.
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +84,7 @@ class FeasibilityResult:
     Attributes:
         is_feasible:        ``True`` if F_compute ≤ B_01 AND F_compute ≤ B_12.
         margin:             Signed margin in bytes/sec.
-                            ``max(F_compute - B_01, F_compute - B_12)``.
+                            ``F_compute - (_PIPELINE_DEPTH × max(B_01, B_12))``.
                             Positive → bandwidth bottleneck (deficit).
                             Negative → bandwidth headroom.
         bandwidth_t0_t1:    T0 ↔ T1 bandwidth in bytes/sec.
@@ -219,14 +216,14 @@ def check_feasibility(
     if compute_throughput <= 0:
         raise ValueError(f"compute_throughput must be > 0, got {compute_throughput}")
 
-    effective_bw = _PIPELINE_DEPTH * max(bandwidth_t0_t1, bandwidth_t1_t2)
+    effective_bw = PIPELINE_DEPTH_STEPS * max(bandwidth_t0_t1, bandwidth_t1_t2)
     margin = compute_throughput - effective_bw
     is_feasible = margin <= 0.0
 
     if is_feasible:
         message = (
             f"OOM-free guarantee active: F_compute ({compute_throughput:.3e} B/s) "
-            f"≤ {_PIPELINE_DEPTH}×max(B_01={bandwidth_t0_t1:.3e}, "
+            f"≤ {PIPELINE_DEPTH_STEPS}×max(B_01={bandwidth_t0_t1:.3e}, "
             f"B_12={bandwidth_t1_t2:.3e}) = {effective_bw:.3e} B/s. "
             f"Headroom = {-margin:.3e} B/s."
         )
@@ -236,7 +233,7 @@ def check_feasibility(
         message = (
             f"Bandwidth bottleneck on {bottleneck}: "
             f"F_compute ({compute_throughput:.3e} B/s) > "
-            f"{_PIPELINE_DEPTH}×max(B_01={bandwidth_t0_t1:.3e}, "
+            f"{PIPELINE_DEPTH_STEPS}×max(B_01={bandwidth_t0_t1:.3e}, "
             f"B_12={bandwidth_t1_t2:.3e}) = {effective_bw:.3e} B/s. "
             f"Runtime will throttle step rate — never crashes, just slows. "
             f"Deficit = {margin:.3e} B/s."

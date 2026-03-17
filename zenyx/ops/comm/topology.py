@@ -14,7 +14,7 @@ import logging
 import warnings
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import torch
 
@@ -131,7 +131,7 @@ class Topology:
     interconnect_type : LinkType
         Dominant interconnect technology.
     ring_bandwidth_gb_s : float
-        Effective unidirectional ring bandwidth in GB/s.
+        Effective ring bandwidth in GB/s (bidirectional for NVLink per S_min convention).
     all_reduce_bandwidth_gb_s : float
         Effective AllReduce bandwidth in GB/s.
     s_min : int
@@ -158,8 +158,10 @@ class Topology:
 # Reference bandwidth / compute values
 # ---------------------------------------------------------------------------
 
-# NVLink 4.0 (H100 SXM): 450 GB/s per direction per link, 900 GB/s bidi
+# NVLink 4.0 (H100 SXM): 450 GB/s per direction per link, 900 GB/s bidirectional
 _NVLINK4_BW_GB_S = 450.0
+# FIX: Use bidirectional bandwidth for ring-attention S_min calculations.
+_NVLINK4_BW_BIDIR_GB_S = _NVLINK4_BW_GB_S * 2.0
 _NVLINK4_LATENCY_US = 1.5
 
 # PCIe Gen4 x16: ~25 GB/s per direction
@@ -170,20 +172,26 @@ _PCIE4_LATENCY_US = 5.0
 _PCIE5_BW_GB_S = 63.0
 _PCIE5_LATENCY_US = 4.0
 
-# TPU v5e ICI: ~400 GB/s per direction per link
+# TPU ICI bandwidths (approximate, per direction)
+_ICI_V4_BW_GB_S = 400.0
 _ICI_V5E_BW_GB_S = 400.0
+_ICI_V5P_BW_GB_S = 1200.0
 _ICI_LATENCY_US = 1.0
 
 # Reference TFLOPS (BF16)
 _H100_SXM_TFLOPS = 989.5
 _H100_PCIE_TFLOPS = 756.0
 _A100_SXM_TFLOPS = 312.0
+_TPU_V4_TFLOPS = 275.0
 _TPU_V5E_TFLOPS = 197.0
+_TPU_V5P_TFLOPS = 459.0
 
 # Precomputed S_min reference values
 _REFERENCE_S_MIN = {
-    "H100_NVLink4": 1_099,  # 989.5 TFLOPS / 450 GB/s × 10³ ÷ 2
+    "H100_NVLink4": 1_099,  # 989.5 TFLOPS / 900 GB/s × 10³ (bidirectional)
+    "TPU_v4_ICI": 687,  # 275 TFLOPS / 400 GB/s × 10³
     "TPU_v5e_ICI": 493,  # 197 TFLOPS / 400 GB/s × 10³
+    "TPU_v5p_ICI": 383,  # 459 TFLOPS / 1200 GB/s × 10³
     "PCIe_Gen4": 15_453,  # 386 TFLOPS / 25 GB/s × 10³  (A100-like)
 }
 
@@ -278,10 +286,12 @@ class TopologyDetector:
             self._add_pcie_links(device_count, links)
 
         interconnect = LinkType.NVLINK if has_nvlink else LinkType.PCIE
-        ring_bw = _NVLINK4_BW_GB_S if has_nvlink else _PCIE4_BW_GB_S
+        ring_bw = _NVLINK4_BW_BIDIR_GB_S if has_nvlink else _PCIE4_BW_GB_S
         # AllReduce effective BW ≈ 2 × (N-1)/N × unidirectional ring BW
+        # FIX: Use per-direction bandwidth for AllReduce even when ring_bw is bidirectional.
+        ring_bw_for_ar = _NVLINK4_BW_GB_S if has_nvlink else ring_bw
         n = max(device_count, 1)
-        ar_bw = 2.0 * ((n - 1) / n) * ring_bw
+        ar_bw = 2.0 * ((n - 1) / n) * ring_bw_for_ar
 
         return Topology(
             devices=devices,
@@ -342,28 +352,45 @@ class TopologyDetector:
             return False
 
         found_nvlink = False
+        # FIX: NVML expects a link index, not a device index; map links via PCI IDs.
+        pci_to_index: Dict[str, int] = {}
+        handles: List[object] = []
+        for i in range(device_count):
+            handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+            handles.append(handle)
+            try:
+                pci_info = pynvml.nvmlDeviceGetPciInfo(handle)
+                bus_id = pci_info.busId.decode() if isinstance(pci_info.busId, bytes) else pci_info.busId
+                pci_to_index[str(bus_id)] = i
+            except Exception:
+                continue
         try:
-            for i in range(device_count):
-                handle_i = pynvml.nvmlDeviceGetHandleByIndex(i)
-                for j in range(device_count):
-                    if i == j:
-                        continue
+            max_links = 12
+            for i, handle_i in enumerate(handles):
+                for link_idx in range(max_links):
                     try:
-                        # Check NVLink status for each potential link
-                        info = pynvml.nvmlDeviceGetNvLinkRemotePciInfo_v2(handle_i, j)
-                        if info is not None:
-                            links.append(
-                                Link(
-                                    src_device=i,
-                                    dst_device=j,
-                                    bandwidth_gb_s=_NVLINK4_BW_GB_S,
-                                    latency_us=_NVLINK4_LATENCY_US,
-                                    link_type=LinkType.NVLINK,
-                                )
-                            )
-                            found_nvlink = True
+                        if not pynvml.nvmlDeviceGetNvLinkState(handle_i, link_idx):
+                            continue
+                    except Exception:
+                        break
+                    try:
+                        info = pynvml.nvmlDeviceGetNvLinkRemotePciInfo_v2(handle_i, link_idx)
                     except Exception:
                         continue
+                    bus_id = info.busId.decode() if isinstance(info.busId, bytes) else info.busId
+                    dst_device = pci_to_index.get(str(bus_id))
+                    if dst_device is None or dst_device == i:
+                        continue
+                    links.append(
+                        Link(
+                            src_device=i,
+                            dst_device=dst_device,
+                            bandwidth_gb_s=_NVLINK4_BW_GB_S,
+                            latency_us=_NVLINK4_LATENCY_US,
+                            link_type=LinkType.NVLINK,
+                        )
+                    )
+                    found_nvlink = True
         finally:
             try:
                 pynvml.nvmlShutdown()
@@ -431,14 +458,32 @@ class TopologyDetector:
         links: List[Link] = []
         device_count = len(tpu_devices)
 
-        for i, dev in enumerate(tpu_devices):
-            # TPU v5e: 16 GiB HBM, 197 TFLOPS BF16
+        # FIX: Parse TPU generation from device_kind to pick specs.
+        kind = str(getattr(tpu_devices[0], "device_kind", "")).lower()
+        if "v5p" in kind:
+            mem_gb = 32.0
+            tflops = _TPU_V5P_TFLOPS
+            ici_bw = _ICI_V5P_BW_GB_S
+        elif "v5e" in kind:
+            mem_gb = 16.0
+            tflops = _TPU_V5E_TFLOPS
+            ici_bw = _ICI_V5E_BW_GB_S
+        elif "v4" in kind:
+            mem_gb = 32.0
+            tflops = _TPU_V4_TFLOPS
+            ici_bw = _ICI_V4_BW_GB_S
+        else:
+            mem_gb = 16.0
+            tflops = _TPU_V5E_TFLOPS
+            ici_bw = _ICI_V5E_BW_GB_S
+
+        for i, _dev in enumerate(tpu_devices):
             devices.append(
                 DeviceInfo(
                     device_id=i,
                     device_type=DeviceType.TPU,
-                    memory_gb=16.0,
-                    compute_tflops=_TPU_V5E_TFLOPS,
+                    memory_gb=mem_gb,
+                    compute_tflops=tflops,
                 )
             )
 
@@ -451,20 +496,20 @@ class TopologyDetector:
                     Link(
                         src_device=i,
                         dst_device=j,
-                        bandwidth_gb_s=_ICI_V5E_BW_GB_S,
+                        bandwidth_gb_s=ici_bw,
                         latency_us=_ICI_LATENCY_US,
                         link_type=LinkType.ICI,
                     )
                 )
 
         n = max(device_count, 1)
-        ar_bw = 2.0 * ((n - 1) / n) * _ICI_V5E_BW_GB_S
+        ar_bw = 2.0 * ((n - 1) / n) * ici_bw
 
         return Topology(
             devices=devices,
             links=links,
             interconnect_type=LinkType.ICI,
-            ring_bandwidth_gb_s=_ICI_V5E_BW_GB_S,
+            ring_bandwidth_gb_s=ici_bw,
             all_reduce_bandwidth_gb_s=ar_bw,
         )
 
@@ -697,12 +742,12 @@ def detect_topology() -> TopologyInfo:
     link_type = topo.interconnect_type
     if link_type == LinkType.NVLINK:
         interconnect = "nvlink"
-        ring_bw = 900.0  # H100 NVLink 4.0 bidirectional
+        ring_bw = _NVLINK4_BW_BIDIR_GB_S
         if backend != "nccl" and dist_available:
             backend = "nccl"
     elif link_type == LinkType.ICI:
         interconnect = "ici_2d_torus"
-        ring_bw = 400.0  # TPU v5e ICI
+        ring_bw = topo.ring_bandwidth_gb_s
         backend = "xla_ici"
     elif link_type == LinkType.PCIE:
         # Distinguish Gen4 vs Gen5
@@ -759,6 +804,9 @@ if __name__ == "__main__":
     print("Testing topology detection...")
     info = detect_topology()
     print(info)
-    assert info.world_size >= 1
-    assert info.s_min_tokens >= 0
+    # FIX: Avoid assert for runtime validation in self-test.
+    if info.world_size < 1:
+        raise RuntimeError(f"Expected world_size >= 1, got {info.world_size}")
+    if info.s_min_tokens < 0:
+        raise RuntimeError(f"Expected s_min_tokens >= 0, got {info.s_min_tokens}")
     print("PASSED")

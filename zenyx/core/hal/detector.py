@@ -98,6 +98,13 @@ _KNOWN_ROCM_GPUS: dict[str, tuple[float, InterconnectType]] = {
     "RX 7900": (61.0, "pcie"),
 }
 
+# TPU generation defaults (approximate, per-chip)
+_TPU_V4_TFLOPS = 275.0
+_TPU_V4_MEM_GB = 32.0
+_TPU_V5E_TFLOPS = 197.0
+_TPU_V5E_MEM_GB = 16.0
+_TPU_V5P_TFLOPS = 459.0
+_TPU_V5P_MEM_GB = 32.0
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +204,8 @@ def _build_rocm_info(
             interconnect = known_interconnect
             break
 
-    bw_t0_t1 = 64.0 * (1024 ** 3) if interconnect in ("xgmi", "infiniband") else 32.0 * (1024 ** 3)
+    # FIX: ROCm detection only distinguishes XGMI vs PCIe today (no IB probe).
+    bw_t0_t1 = 64.0 * (1024 ** 3) if interconnect == "xgmi" else 32.0 * (1024 ** 3)
 
     return HardwareInfo(
         backend="rocm",
@@ -222,7 +230,8 @@ def _probe_nvlink() -> InterconnectType:
             ["nvidia-smi", "topo", "-m"],
             capture_output=True,
             text=True,
-            timeout=5,
+            # FIX: Use a shorter timeout to avoid hanging hardware detection.
+            timeout=2,
         )
         if result.returncode == 0 and "NV" in result.stdout:
             return "nvlink"
@@ -248,10 +257,25 @@ def _detect_xla() -> HardwareInfo | None:
         return None
 
     device_count = len(tpu_devices)
-    device_name = str(tpu_devices[0].device_kind) if hasattr(tpu_devices[0], "device_kind") else "TPU"
+    device_kind = (
+        str(tpu_devices[0].device_kind) if hasattr(tpu_devices[0], "device_kind") else "TPU"
+    )
+    device_name = device_kind
 
-    # TPU v5e: 16 GiB HBM per chip, ICI ≈ 1.6 TB/s bisection
-    per_device_mem = 16 * (1024 ** 3)  # default; may vary by generation
+    # FIX: Support TPU v4, v5e, and v5p by parsing the device kind string.
+    kind_lower = device_kind.lower()
+    if "v5p" in kind_lower:
+        per_device_mem = _TPU_V5P_MEM_GB * (1024 ** 3)
+        compute_tflops = _TPU_V5P_TFLOPS
+    elif "v5e" in kind_lower:
+        per_device_mem = _TPU_V5E_MEM_GB * (1024 ** 3)
+        compute_tflops = _TPU_V5E_TFLOPS
+    elif "v4" in kind_lower:
+        per_device_mem = _TPU_V4_MEM_GB * (1024 ** 3)
+        compute_tflops = _TPU_V4_TFLOPS
+    else:
+        per_device_mem = _TPU_V5E_MEM_GB * (1024 ** 3)
+        compute_tflops = _TPU_V5E_TFLOPS
 
     logger.info("XLA/TPU detected: %d × %s", device_count, device_name)
 
@@ -262,7 +286,7 @@ def _detect_xla() -> HardwareInfo | None:
         interconnect="ici",
         bandwidth_t0_t1=20.0 * (1024 ** 3),   # host↔TPU ≈ 20 GB/s
         bandwidth_t1_t2=7.0 * (1024 ** 3),
-        compute_tflops=197.0,  # TPU v5e FP16
+        compute_tflops=compute_tflops,
         device_name=device_name,
     )
 

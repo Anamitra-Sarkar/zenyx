@@ -136,6 +136,7 @@ class AsyncCheckpointer:
         self._prev_checksums: Dict[str, str] = {}
         self._prev_meta_entries: Dict[str, "_ShardMeta"] = {}
         self._pending_futures: List[Future[None]] = []
+        self._async_errors: List[BaseException] = []
 
     # -- Public API ---------------------------------------------------------
 
@@ -162,6 +163,8 @@ class AsyncCheckpointer:
         concurrent.futures.Future[None]
             Resolves when the I/O completes.
         """
+        # FIX: Surface any prior async errors before scheduling new work.
+        self._raise_async_errors()
         snapshot: Dict[str, bytes] = {}
         checksums: Dict[str, str] = {}
         # Start with ALL entries from the previous checkpoint manifest.
@@ -201,6 +204,8 @@ class AsyncCheckpointer:
         future: Future[None] = self._executor.submit(
             self._write_shards, path, snapshot, meta_entries, checksums, current_meta
         )
+        # FIX: Capture background exceptions promptly for training-loop polling.
+        future.add_done_callback(self._capture_async_exception)
         with self._lock:
             self._pending_futures = [f for f in self._pending_futures if not f.done()]
             self._pending_futures.append(future)
@@ -293,6 +298,14 @@ class AsyncCheckpointer:
             futures = list(self._pending_futures)
         for fut in futures:
             fut.result(timeout=timeout)
+        self._raise_async_errors()
+
+    def poll(self) -> None:
+        """Check for completed background errors without blocking."""
+        # FIX: Allow training loops to surface async checkpoint errors promptly.
+        self._raise_async_errors()
+        with self._lock:
+            self._pending_futures = [f for f in self._pending_futures if not f.done()]
 
     def shutdown(self) -> None:
         """Wait for pending I/O and shut down the thread pool."""
@@ -355,6 +368,20 @@ class AsyncCheckpointer:
             len(snapshot),
             self.rank,
         )
+
+    def _capture_async_exception(self, future: Future[None]) -> None:
+        exc = future.exception()
+        if exc is None:
+            return
+        with self._lock:
+            self._async_errors.append(exc)
+
+    def _raise_async_errors(self) -> None:
+        with self._lock:
+            if not self._async_errors:
+                return
+            exc = self._async_errors.pop(0)
+        raise RuntimeError("Async checkpoint save failed") from exc
 
     def __repr__(self) -> str:
         with self._lock:

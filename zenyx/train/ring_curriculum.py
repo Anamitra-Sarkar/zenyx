@@ -57,6 +57,7 @@ logger = logging.getLogger(__name__)
 
 _CONVERGENCE_WINDOW: int = 200  # Steps to check for convergence
 _CONVERGENCE_THRESHOLD: float = 1e-3  # Loss delta threshold
+_RESHARD_SUMMARY_INTERVAL: int = 3  # Summary log interval (reshard events)
 
 # Default exponential curriculum: (seq_len, ring_degree)
 _DEFAULT_CURRICULUM: List[Tuple[int, int]] = [
@@ -208,7 +209,15 @@ class _PRNGKeyTable:
         torch.Tensor
             PRNG keys for this device's token slice.
         """
-        tokens_per_device = active_seq_len // max(ring_degree, 1)
+        # FIX: Require even token division across ring shards.
+        if ring_degree <= 0:
+            raise ValueError(f"ring_degree must be positive, got {ring_degree}")
+        if active_seq_len % ring_degree != 0:
+            raise ValueError(
+                f"active_seq_len={active_seq_len} must be divisible by ring_degree={ring_degree} "
+                "to avoid uneven token shards."
+            )
+        tokens_per_device = active_seq_len // ring_degree
         start = device_id * tokens_per_device
         end = start + tokens_per_device
         return self._keys[start:end]
@@ -422,8 +431,8 @@ class RingCurriculumManager:
             device_id, len(new_keys),
         )
 
-        # After 3 reshards, log summary
-        if self._reshard_count >= 3:
+        # FIX: Log summary once per N reshards instead of every reshard after N.
+        if self._reshard_count % _RESHARD_SUMMARY_INTERVAL == 0:
             avg_ms = sum(self._reshard_times_ms) / len(self._reshard_times_ms)
             logger.info(
                 "Reshard summary after %d events: avg=%.2f ms. "

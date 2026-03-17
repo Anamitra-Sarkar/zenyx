@@ -445,7 +445,7 @@ def ring_attention_tpu(
     axis_name: str = "devices",
     causal: bool = True,
 ) -> Any:
-    """Ring Attention for TPU v5e/v5p using Pallas + Shardy.
+    """Ring Attention for TPU v4/v5e/v5p using Pallas + Shardy.
 
     The sequence dimension is sharded across devices via ``pmap``/``shard_map``.
     Each device holds ``seq_local = seq_total / num_devices`` tokens.
@@ -453,6 +453,7 @@ def ring_attention_tpu(
     Communication uses ``lax.ppermute`` inside ``custom_partitioning`` boundaries
     so XLA cannot reorder it relative to the Pallas attention kernel.
 
+    S_min for TPU v4 ICI = 687 tokens (F=275 TFLOPS, B=400 GB/s).
     S_min for TPU v5e ICI = 493 tokens (F=197 TFLOPS, B=400 GB/s).
     S_min for TPU v5p ICI = 383 tokens (F=459 TFLOPS, B=1200 GB/s).
 
@@ -484,6 +485,7 @@ def ring_attention_tpu(
     Time complexity:  O(P × S_local² × D) where P = ring size
     Space complexity: O(S_local × H × D)
     """
+    # FIX: Document TPU v4 support alongside v5e/v5p.
     if not _HAS_JAX:
         raise ImportError(
             "JAX is not installed. Install with: pip install jax[tpu]"
@@ -512,7 +514,8 @@ if __name__ == "__main__":
         print("JAX not available — verifying graceful fallback")
         try:
             ring_attention_tpu(None, None, None)
-            assert False, "Should have raised ImportError"
+            # FIX: Avoid assert for runtime validation in self-test.
+            raise RuntimeError("Expected ring_attention_tpu to raise ImportError")
         except ImportError as e:
             print(f"Correctly raised ImportError: {e}")
     print("PASSED")

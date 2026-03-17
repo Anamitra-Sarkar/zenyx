@@ -321,7 +321,9 @@ class BraidedPipeline:
         """
         if self._schedule is None:
             self.generate_schedule()
-        assert self._schedule is not None
+        if self._schedule is None:
+            # FIX: Avoid assert for runtime validation when schedule generation fails.
+            raise RuntimeError("BraidedPipeline schedule generation failed.")
 
         # Infer device from the first microbatch so all fallback tensors
         # are placed on the same device as the actual activations.
