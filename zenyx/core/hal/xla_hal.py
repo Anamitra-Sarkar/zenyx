@@ -126,7 +126,7 @@ class XlaHAL(HALBase):
         """Allocate *size_bytes* on *tier*.
 
         For T0 on TPU, uses ``jax.device_put`` to place data on HBM.
-        For T1, uses host (pinned if torch available).
+        For T1, uses host (pinned if CUDA is available, unpinned otherwise).
         For T2, uses mmap spill file.
 
         Time complexity:  O(1) amortised.
@@ -164,7 +164,10 @@ class XlaHAL(HALBase):
             logger.warning("XlaHAL: T1 capacity exceeded — spilling to T2")
             return self._alloc_t2(size_bytes)
         if _TORCH_AVAILABLE:
-            t = torch.empty(size_bytes, dtype=torch.uint8, pin_memory=True)
+            # pin_memory requires a CUDA runtime — guard to avoid
+            # RuntimeError: Cannot pin memory without CUDA on TPU-only hosts.
+            _pin = torch.cuda.is_available()
+            t = torch.empty(size_bytes, dtype=torch.uint8, pin_memory=_pin)
             data = t
         elif _JAX_AVAILABLE:
             data = _jnp.zeros(size_bytes, dtype=_jnp.uint8)
