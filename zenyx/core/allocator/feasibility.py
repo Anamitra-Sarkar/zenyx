@@ -3,7 +3,7 @@
 Provides three key utilities:
 
 1. **check_feasibility** — verifies the formal OOM-free guarantee condition:
-   ``F_compute ≤ _PIPELINE_DEPTH × max(B_01, B_12)``
+   ``F_compute ≤ FEASIBILITY_PIPELINE_DEPTH × max(B_01, B_12)``
    i.e. the pipeline lookahead depth times the maximum available bandwidth must
    cover the effective compute demand (in bytes/sec), so eviction always keeps
    up with compute.
@@ -21,12 +21,16 @@ Unit contract
 All three arguments to ``check_feasibility`` must be in **bytes/sec**
 (i.e. a bandwidth).  The OOM-free condition is:
 
-    F_compute ≤ _PIPELINE_DEPTH × max(B_01, B_12)
+    F_compute ≤ FEASIBILITY_PIPELINE_DEPTH × max(B_01, B_12)
 
 where *B_01* = T1→T0 bandwidth (bytes/sec), *B_12* = T2→T1 bandwidth
 (bytes/sec), *F_compute* = effective memory bandwidth equivalent of
 compute in bytes/sec (= TFLOPS × 10¹² / FLOP_PER_BYTE), and
-*_PIPELINE_DEPTH* = prefetch lookahead depth in steps.
+*FEASIBILITY_PIPELINE_DEPTH* = analytical proof parameter (number of
+pipeline steps over which bandwidth must cover compute throughput).
+
+Note: FEASIBILITY_PIPELINE_DEPTH is a mathematical proof parameter, NOT
+the runtime prefetch window of TierAllocator (PREFETCH_WINDOW_OPS = 3).
 
 Activation memory fix
 ---------------------
@@ -59,20 +63,14 @@ import math
 from dataclasses import dataclass
 from typing import Optional
 
+from zenyx.core.allocator.constants import FEASIBILITY_PIPELINE_DEPTH
+
 logger = logging.getLogger("zenyx.core.allocator.feasibility")
 
 # Arithmetic intensity of a typical transformer layer in BF16:
 # ~16 FLOP per byte (dominant cost is large matmuls at batch>1).
 # Reference: Kaplan et al. 2020, Korthikanti et al. 2022.
 _TRANSFORMER_FLOP_PER_BYTE: float = 16.0
-
-# Pipeline prefetch depth used by the formal feasibility bound.
-# This constant matches TierAllocator prefetch lookahead assumptions in the
-# allocator design docs (historically a 100-step asynchronous horizon):
-#   F_compute ≤ depth × max(B_01, B_12)
-# Keep this in sync with TierAllocator prefetch-horizon tuning so the
-# guarantee remains calibrated to runtime prefetch behavior.
-_PIPELINE_DEPTH: int = 100
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +85,7 @@ class FeasibilityResult:
     Attributes:
         is_feasible:        ``True`` if F_compute ≤ B_01 AND F_compute ≤ B_12.
         margin:             Signed margin in bytes/sec.
-                            ``max(F_compute - B_01, F_compute - B_12)``.
+                            ``F_compute - (FEASIBILITY_PIPELINE_DEPTH × max(B_01, B_12))``.
                             Positive → bandwidth bottleneck (deficit).
                             Negative → bandwidth headroom.
         bandwidth_t0_t1:    T0 ↔ T1 bandwidth in bytes/sec.
@@ -196,7 +194,7 @@ def check_feasibility(
 
     The condition is::
 
-        F_compute ≤ _PIPELINE_DEPTH × max(B_01, B_12)
+        F_compute ≤ FEASIBILITY_PIPELINE_DEPTH × max(B_01, B_12)
 
     Args:
         bandwidth_t0_t1:    T0 ↔ T1 bandwidth in bytes/sec.
@@ -219,26 +217,26 @@ def check_feasibility(
     if compute_throughput <= 0:
         raise ValueError(f"compute_throughput must be > 0, got {compute_throughput}")
 
-    effective_bw = _PIPELINE_DEPTH * max(bandwidth_t0_t1, bandwidth_t1_t2)
+    effective_bw = FEASIBILITY_PIPELINE_DEPTH * max(bandwidth_t0_t1, bandwidth_t1_t2)
     margin = compute_throughput - effective_bw
     is_feasible = margin <= 0.0
 
     if is_feasible:
         message = (
             f"OOM-free guarantee active: F_compute ({compute_throughput:.3e} B/s) "
-            f"≤ {_PIPELINE_DEPTH}×max(B_01={bandwidth_t0_t1:.3e}, "
+            f"\u2264 {FEASIBILITY_PIPELINE_DEPTH}\u00d7max(B_01={bandwidth_t0_t1:.3e}, "
             f"B_12={bandwidth_t1_t2:.3e}) = {effective_bw:.3e} B/s. "
             f"Headroom = {-margin:.3e} B/s."
         )
         logger.info(message)
     else:
-        bottleneck = "T1↔T2" if bandwidth_t0_t1 >= bandwidth_t1_t2 else "T0↔T1"
+        bottleneck = "T1\u2194T2" if bandwidth_t0_t1 >= bandwidth_t1_t2 else "T0\u2194T1"
         message = (
             f"Bandwidth bottleneck on {bottleneck}: "
             f"F_compute ({compute_throughput:.3e} B/s) > "
-            f"{_PIPELINE_DEPTH}×max(B_01={bandwidth_t0_t1:.3e}, "
+            f"{FEASIBILITY_PIPELINE_DEPTH}\u00d7max(B_01={bandwidth_t0_t1:.3e}, "
             f"B_12={bandwidth_t1_t2:.3e}) = {effective_bw:.3e} B/s. "
-            f"Runtime will throttle step rate — never crashes, just slows. "
+            f"Runtime will throttle step rate \u2014 never crashes, just slows. "
             f"Deficit = {margin:.3e} B/s."
         )
         logger.warning(message)
@@ -262,8 +260,8 @@ def check_feasibility_for_hardware(
     """Convenience wrapper: convert TFLOPS then call :func:`check_feasibility`.
 
     Args:
-        bandwidth_t0_t1: T0 ↔ T1 bandwidth in bytes/sec.
-        bandwidth_t1_t2: T1 ↔ T2 bandwidth in bytes/sec.
+        bandwidth_t0_t1: T0 \u2194 T1 bandwidth in bytes/sec.
+        bandwidth_t1_t2: T1 \u2194 T2 bandwidth in bytes/sec.
         compute_tflops:  Peak compute in TFLOPS.
         flop_per_byte:   Arithmetic intensity (default 16.0 for BF16 matmul).
 
@@ -312,7 +310,7 @@ def estimate_memory_budget(
 
     * **Activations** (fallback, when micro_bs/seq_len/d_ff not provided)::
 
-          activations_gb ≈ 2 × weights_gb   (selective checkpointing estimate)
+          activations_gb \u2248 2 × weights_gb   (selective checkpointing estimate)
 
       A deprecation warning is logged when the fallback is used.
 
@@ -330,18 +328,18 @@ def estimate_memory_budget(
         micro_bs:     Micro-batch size per training step (samples, not tokens).
                       Required for accurate activation estimate.
         seq_len:      Sequence length in tokens. Required for accurate estimate.
-        d_ff:         Feed-forward expansion dimension (e.g. 4096 for 4× d_model=1024).
+        d_ff:         Feed-forward expansion dimension (e.g. 4096 for 4\u00d7 d_model=1024).
                       Required for accurate estimate.
 
     Returns:
         :class:`MemoryBudget` with all component sizes in GiB.
 
     Raises:
-        ValueError: If any required numeric argument is ≤ 0.
+        ValueError: If any required numeric argument is \u2264 0.
         UserWarning: Logged (not raised) when micro_bs/seq_len/d_ff are omitted
-            and the 2×weights fallback is used.
+            and the 2\u00d7weights fallback is used.
 
-    Example — accurate (recommended)::
+    Example \u2014 accurate (recommended)::
 
         budget = estimate_memory_budget(
             params=634e6, vocab_size=100_277, context_len=8192,
@@ -351,7 +349,7 @@ def estimate_memory_budget(
         )
         # budget.activations_gb == 20.0 GiB (not 2.5 GiB)
 
-    Example — legacy (fallback, emits warning)::
+    Example \u2014 legacy (fallback, emits warning)::
 
         budget = estimate_memory_budget(
             params=634e6, vocab_size=100_277, context_len=8192,
@@ -385,7 +383,7 @@ def estimate_memory_budget(
         # during backward pass. bf16[micro_bs, seq_len, d_ff] per layer.
         # This is the tensor that caused the 55 GB XLA OOM:
         #   micro_bs=8, seq_len=8192, d_ff=4096, n_layers=20, dtype=bf16
-        #   → 8 × 8192 × 4096 × 20 × 2 / 2^30 = 20.0 GiB
+        #   \u2192 8 \u00d7 8192 \u00d7 4096 \u00d7 20 \u00d7 2 / 2^30 = 20.0 GiB
         peak_activation_bytes = micro_bs * seq_len * d_ff * n_layers * dtype_bytes
         activations_gb = peak_activation_bytes / GIB
         logger.info(
@@ -400,7 +398,7 @@ def estimate_memory_budget(
         activations_gb = 2.0 * weights_gb
         logger.warning(
             "estimate_memory_budget called without micro_bs/seq_len/d_ff. "
-            "Using legacy 2×weights approximation (%.2f GiB). "
+            "Using legacy 2\u00d7weights approximation (%.2f GiB). "
             "This may significantly underestimate peak activation memory. "
             "Pass micro_bs, seq_len, and d_ff for an accurate budget check.",
             activations_gb,

@@ -694,6 +694,9 @@ if __name__ == "__main__":
     k = torch.randn(1, 32, 4, 64, dtype=torch.float32)
     v = torch.randn(1, 32, 4, 64, dtype=torch.float32)
     out = attn(q, k, v, causal=True)
-    assert out.shape == (1, 32, 8, 64), f"Expected (1, 32, 8, 64), got {out.shape}"
-    assert not out.isnan().any(), "Output contains NaN"
+    # FIX: Avoid assert for runtime validation in self-test.
+    if out.shape != (1, 32, 8, 64):
+        raise RuntimeError(f"Expected (1, 32, 8, 64), got {out.shape}")
+    if out.isnan().any():
+        raise RuntimeError("Output contains NaN")
     print("PASSED")

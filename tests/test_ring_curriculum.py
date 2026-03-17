@@ -133,6 +133,15 @@ class TestStageAdvancement:
         # Different devices get different token ranges
         assert not torch.equal(keys_0, keys_1)
 
+    def test_prng_keys_requires_even_division(self) -> None:
+        """active_seq_len must divide evenly by ring_degree."""
+        schedule = [(1001, 2)]
+        mgr = RingCurriculumManager(
+            max_seq_len=1001, world_size=2, curriculum_schedule=schedule
+        )
+        with pytest.raises(ValueError, match="divisible"):
+            mgr.get_prng_keys(device_id=0)
+
     def test_optimizer_state_not_resharded(self) -> None:
         """Verify optimizer state is NOT part of the reshard operation.
 

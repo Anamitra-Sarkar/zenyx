@@ -27,7 +27,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field, replace
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from zenyx.core.hal.detector import HardwareInfo
 from zenyx.ops.comm.topology import Topology
@@ -207,6 +207,8 @@ class ParallelismPlanner:
             estimated_tokens_per_sec=tokens_per_sec,
             memory_per_device_gb=mem_per_device,
         )
+        # FIX: Ensure tp × pp × dp × ring never exceeds total devices.
+        plan = self._clamp_plan_to_devices(plan, total_devices)
         self._last_plan = plan
         logger.info("Parallelism plan: %s", plan)
         return plan
@@ -306,6 +308,8 @@ class ParallelismPlanner:
                         new_plan.tp_degree,
                     )
 
+        # FIX: Ensure tp × pp × dp × ring never exceeds total devices.
+        new_plan = self._clamp_plan_to_devices(new_plan, self._hw.device_count)
         self._last_plan = new_plan
         return new_plan
 
@@ -333,9 +337,8 @@ class ParallelismPlanner:
 
         Time: O(1).
         """
-        # Estimate architecture from params
-        d_model = int(math.sqrt(model_params / 12))
-        n_layers = max(1, int(model_params / (12 * d_model * d_model)))
+        # FIX: Estimate architecture from params using anchored heuristics.
+        d_model, n_layers = self._estimate_transformer_dims(model_params)
         n_kv_heads = max(1, d_model // 128)  # GQA heuristic
         n_heads_estimate = max(1, d_model // 64)
         d_head = d_model // n_heads_estimate
@@ -379,11 +382,115 @@ class ParallelismPlanner:
         # Cap at available devices
         ring_degree = min(target_ring, total_devices)
 
-        # Ensure we don't use more than 50% of devices for ring alone
-        ring_degree = min(ring_degree, total_devices // 2) if total_devices > 2 else 1
+        if ring_degree < target_ring:
+            logger.warning(
+                "Ring degree requirement %d cannot be met with %d devices; "
+                "using ring_degree=%d. Expect ring attention bottlenecks.",
+                target_ring,
+                total_devices,
+                ring_degree,
+            )
 
-        # At minimum 1
+        # FIX: Do not silently override the ≥40 ring spec; warn instead of clamping.
+        if total_devices > 2 and ring_degree > total_devices // 2:
+            logger.warning(
+                "Ring degree %d uses >50%% of devices (%d total). "
+                "This may reduce TP/DP headroom but preserves spec requirements.",
+                ring_degree,
+                total_devices,
+            )
+
         return max(1, ring_degree)
+
+    @staticmethod
+    def _round_to_multiple(value: float, multiple: int) -> int:
+        rounded = int(round(value / multiple) * multiple)
+        return max(multiple, rounded)
+
+    def _estimate_transformer_dims(self, model_params: float) -> Tuple[int, int]:
+        """Estimate (d_model, n_layers) from total params using anchored heuristics.
+
+        Anchors: 7B/13B/70B/120B — accurate to within ~10-15% for common LLMs.
+        """
+        if model_params <= 0:
+            raise ValueError(f"model_params must be > 0, got {model_params}")
+
+        anchors = [
+            (7e9, 4096, 32),
+            (13e9, 5120, 40),
+            (70e9, 8192, 80),
+            (120e9, 10240, 96),
+        ]
+
+        def _scale_from_ratio(params: float, layer_ratio: float) -> Tuple[int, int]:
+            # params ≈ 12 * n_layers * d_model^2, with n_layers ≈ layer_ratio * d_model / 128
+            coeff = 12.0 * (layer_ratio / 128.0)
+            d_model_f = (params / coeff) ** (1.0 / 3.0)
+            d_model_i = self._round_to_multiple(d_model_f, 128)
+            n_layers_f = layer_ratio * (d_model_i / 128.0)
+            n_layers_i = max(1, int(round(n_layers_f / 2.0) * 2))
+            return d_model_i, n_layers_i
+
+        if model_params <= anchors[0][0]:
+            # Small-model regime — scale with n_layers ≈ d_model / 128.
+            return _scale_from_ratio(model_params, layer_ratio=1.0)
+        if model_params >= anchors[-1][0]:
+            # Large-model regime — scale with slightly deeper stacks.
+            return _scale_from_ratio(model_params, layer_ratio=1.25)
+
+        for (p0, d0, l0), (p1, d1, l1) in zip(anchors, anchors[1:]):
+            if p0 <= model_params <= p1:
+                t = (math.log(model_params) - math.log(p0)) / (math.log(p1) - math.log(p0))
+                d_model_f = math.exp(math.log(d0) + t * (math.log(d1) - math.log(d0)))
+                n_layers_f = math.exp(math.log(l0) + t * (math.log(l1) - math.log(l0)))
+                d_model_i = self._round_to_multiple(d_model_f, 128)
+                n_layers_i = max(1, int(round(n_layers_f / 2.0) * 2))
+                return d_model_i, n_layers_i
+
+        return _scale_from_ratio(model_params, layer_ratio=1.0)
+
+    def _clamp_plan_to_devices(
+        self, plan: ParallelismPlan, total_devices: int
+    ) -> ParallelismPlan:
+        """Clamp plan degrees so tp × pp × dp × ring ≤ total_devices."""
+        if total_devices <= 0:
+            raise ValueError(f"total_devices must be > 0, got {total_devices}")
+
+        denom = plan.pp_degree * plan.ring_degree
+        if denom <= 0:
+            raise ValueError("pp_degree and ring_degree must be positive")
+
+        max_tp = max(1, total_devices // denom)
+        tp_degree = plan.tp_degree
+        if tp_degree > max_tp:
+            # FIX: Clamp TP when replanning would overcommit devices.
+            tp_degree = max(1, 2 ** int(math.log2(max_tp)))
+            logger.warning(
+                "Clamping TP to %d to fit %d devices (pp=%d, ring=%d).",
+                tp_degree,
+                total_devices,
+                plan.pp_degree,
+                plan.ring_degree,
+            )
+
+        denom = tp_degree * plan.pp_degree * plan.ring_degree
+        max_dp = max(1, total_devices // denom)
+        dp_degree = plan.dp_degree
+        if dp_degree > max_dp:
+            # FIX: Clamp DP so tp × pp × dp × ring stays within total devices.
+            dp_degree = max_dp
+            logger.warning(
+                "Clamping DP to %d to fit %d devices (tp=%d, pp=%d, ring=%d).",
+                dp_degree,
+                total_devices,
+                tp_degree,
+                plan.pp_degree,
+                plan.ring_degree,
+            )
+
+        if tp_degree != plan.tp_degree or dp_degree != plan.dp_degree:
+            return replace(plan, tp_degree=tp_degree, dp_degree=dp_degree)
+        return plan
 
     def _compute_tp_degree(
         self,

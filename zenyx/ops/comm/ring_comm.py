@@ -425,8 +425,12 @@ if __name__ == "__main__":
 
     topo = Topology()
     comm = RingCommunicator(topology=topo)
-    assert comm.world_size == 1
-    assert comm.num_steps == 0
-    assert comm.current_kv_rank == 0
+    # FIX: Avoid assert for runtime validation in self-test.
+    if comm.world_size != 1:
+        raise RuntimeError(f"Expected world_size=1, got {comm.world_size}")
+    if comm.num_steps != 0:
+        raise RuntimeError(f"Expected num_steps=0, got {comm.num_steps}")
+    if comm.current_kv_rank != 0:
+        raise RuntimeError(f"Expected current_kv_rank=0, got {comm.current_kv_rank}")
     print(repr(comm))
     print("PASSED")

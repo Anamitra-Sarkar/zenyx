@@ -201,8 +201,9 @@ class TrainingController:
         Returns
         -------
         bool
-            ``True`` if context length changed.
+            ``True`` if context length changed after the first recorded step.
         """
+        # FIX: Treat the first step as the baseline (no shift) to avoid spurious replans.
         if self._last_context_len is None:
             return False
         return current_context_len != self._last_context_len

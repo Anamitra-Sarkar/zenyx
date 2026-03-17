@@ -325,6 +325,9 @@ if __name__ == "__main__":
     k = torch.randn(1, 64, 4, 32)
     v = torch.randn(1, 64, 4, 32)
     out = flash_attention_cpu(q, k, v, causal=True, chunk_size=16)
-    assert out.shape == (1, 64, 4, 32), f"Expected (1, 64, 4, 32), got {out.shape}"
-    assert not out.isnan().any(), "Output contains NaN"
+    # FIX: Avoid assert for runtime validation in self-test.
+    if out.shape != (1, 64, 4, 32):
+        raise RuntimeError(f"Expected (1, 64, 4, 32), got {out.shape}")
+    if out.isnan().any():
+        raise RuntimeError("Output contains NaN")
     print("PASSED")

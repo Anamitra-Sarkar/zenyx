@@ -301,6 +301,17 @@ class BeladyKVCacheManager:
         self._total_payload_gb: float = 0.0
         self._compute_time_s: float = 0.0
 
+        # FIX: Emit low-bandwidth warning immediately for user-visible config errors.
+        if self.nvme_bandwidth_gbs < MIN_NVME_BANDWIDTH_GBS:
+            warnings.warn(
+                f"Declared NVMe bandwidth ({self.nvme_bandwidth_gbs:.1f} GB/s) is below "
+                f"the minimum {MIN_NVME_BANDWIDTH_GBS} GB/s required for 128K context. "
+                "A single PCIe Gen4 NVMe (7.5 GB/s) is insufficient. "
+                "Consider PCIe Gen5 or RAID-0 NVMe configuration.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
     def validate_bandwidth(self) -> None:
         """Run BOTH feasibility formulas and log results.
 

@@ -332,12 +332,12 @@ class AsyncProfiler:
         if not batch:
             return
 
+        pending_again: List[ProfileHandle] = []
         for handle in batch:
             elapsed_ms = self._resolve_elapsed(handle)
             if elapsed_ms is None:
-                # Not yet ready — put back
-                with self._pending_lock:
-                    self._pending.append(handle)
+                # FIX: Preserve ordering for late events to avoid starvation.
+                pending_again.append(handle)
                 continue
 
             with self._timings_lock:
@@ -351,6 +351,10 @@ class AsyncProfiler:
                 timing.avg_ms = timing.total_ms / timing.count
                 timing.min_ms = min(timing.min_ms, elapsed_ms)
                 timing.max_ms = max(timing.max_ms, elapsed_ms)
+
+        if pending_again:
+            with self._pending_lock:
+                self._pending = pending_again + self._pending
 
     def _resolve_elapsed(self, handle: ProfileHandle) -> Optional[float]:
         """Resolve a handle to elapsed milliseconds, or ``None`` if not ready.

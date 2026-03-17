@@ -188,7 +188,9 @@ class TPUModelLoader:
         ----------
         Time *O(M)*, space *O(M)*.
         """
-        assert self._executor is not None
+        if self._executor is None:
+            # FIX: Avoid assert for runtime validation in async loader path.
+            raise RuntimeError("TPUModelLoader executor is not initialised.")
         future: Future[Dict[str, torch.Tensor]] = self._executor.submit(
             torch.load,
             str(self.model_path),
@@ -207,7 +209,9 @@ class TPUModelLoader:
         try:
             from safetensors.torch import load_file  # type: ignore[import-untyped]
 
-            assert self._executor is not None
+            if self._executor is None:
+                # FIX: Avoid assert for runtime validation in async loader path.
+                raise RuntimeError("TPUModelLoader executor is not initialised.")
             future: Future[Dict[str, torch.Tensor]] = self._executor.submit(
                 load_file, str(self.model_path), device="cpu"
             )
@@ -228,7 +232,9 @@ class TPUModelLoader:
         ----------
         Time *O(M / B_hbm)*, space *O(M)* on device.
         """
-        assert _jax is not None and _jnp is not None
+        if _jax is None or _jnp is None:
+            # FIX: Avoid assert for runtime validation in JAX transfer path.
+            raise RuntimeError("JAX is unavailable for TPU transfer.")
 
         result: Dict[str, torch.Tensor] = {}
         tpu_devices = _jax.devices("tpu")

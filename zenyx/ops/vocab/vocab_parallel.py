@@ -225,10 +225,14 @@ if __name__ == "__main__":
     local_logits = torch.randn(4, 100, dtype=torch.float32, requires_grad=True)
     targets = torch.randint(0, 100, (4,))
     loss = vocab_parallel_cross_entropy(local_logits, targets, process_group=None)
-    assert loss.shape == (4,), f"Expected shape (4,), got {loss.shape}"
-    assert not loss.isnan().any(), "Loss contains NaN"
+    # FIX: Avoid assert for runtime validation in self-test.
+    if loss.shape != (4,):
+        raise RuntimeError(f"Expected shape (4,), got {loss.shape}")
+    if loss.isnan().any():
+        raise RuntimeError("Loss contains NaN")
     # Test backward
     loss.sum().backward()
-    assert local_logits.grad is not None, "No gradient computed"
+    if local_logits.grad is None:
+        raise RuntimeError("No gradient computed")
     print(f"Loss: {loss}")
     print("PASSED")

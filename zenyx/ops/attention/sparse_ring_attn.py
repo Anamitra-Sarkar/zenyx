@@ -341,6 +341,13 @@ class SparseRingAttentionKernel:
         self.num_layers = num_layers
         self.device_id = device_id
 
+        # FIX: Sparse ring attention assumes one ring step per device.
+        if ring_degree != world_size:
+            raise ValueError(
+                f"ring_degree must equal world_size for sparse ring attention "
+                f"(got ring_degree={ring_degree}, world_size={world_size})."
+            )
+
         # Depth check for universal approximation guarantee.
         # This is a hard architectural invariant: sparse ring attention only
         # guarantees transitivity (UAP) when the model has at least

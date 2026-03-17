@@ -210,7 +210,9 @@ class GDSModelLoader:
         ----------
         Time *O(M)*, space *O(M)*.
         """
-        assert self._executor is not None
+        if self._executor is None:
+            # FIX: Avoid assert for runtime validation in async loader path.
+            raise RuntimeError("GDSModelLoader executor is not initialised.")
         future: Future[Dict[str, torch.Tensor]] = self._executor.submit(
             torch.load,
             str(self.model_path),
@@ -229,7 +231,9 @@ class GDSModelLoader:
         try:
             from safetensors.torch import load_file  # type: ignore[import-untyped]
 
-            assert self._executor is not None
+            if self._executor is None:
+                # FIX: Avoid assert for runtime validation in async loader path.
+                raise RuntimeError("GDSModelLoader executor is not initialised.")
             future: Future[Dict[str, torch.Tensor]] = self._executor.submit(
                 load_file, str(self.model_path), device="cpu"
             )
@@ -327,7 +331,9 @@ class GDSModelLoader:
                 if cuda_available:
                     # Pin the CPU tensor for async H2D transfer.
                     pinned = tensor.pin_memory()
-                    assert slot.stream is not None
+                    if slot.stream is None:
+                        # FIX: Avoid assert for runtime validation in CUDA stream setup.
+                        raise RuntimeError("CUDA stream was not initialised for buffer slot.")
                     with torch.cuda.stream(slot.stream):
                         gpu_tensor = pinned.to(self.device, non_blocking=True)
                     slot.stream.synchronize()
