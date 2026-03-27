@@ -1,0 +1,8 @@
+{
+  "projectId": "97e3682e-064f-45cd-ae06-0d28c09318e0",
+  "createdAt": 1774627158954,
+  "startupCommands": [
+    "pip install -e .[dev] --no-cache-dir; python -m pytest tests/ -x"
+  ],
+  "templateId": "any"
+}

@@ -113,9 +113,10 @@ def validate_bandwidth_corrected(
     min_bw = min(dram_bandwidth_gbs, nvme_bandwidth_gbs)
     required_bw = total_payload_gb / compute_time_s
     passes = min_bw >= required_bw
+    unicode_geq = '\u2265'
     explanation = (
         f"Corrected formula: min(B_01={dram_bandwidth_gbs:.1f}, B_12={nvme_bandwidth_gbs:.1f}) "
-        f"= {min_bw:.2f} GB/s {'\u2265' if passes else '<'} "
+        f"= {min_bw:.2f} GB/s {unicode_geq if passes else '<'} "
         f"required {required_bw:.2f} GB/s (payload={total_payload_gb:.0f} GB / "
         f"compute={compute_time_s:.0f} s). {'PASS' if passes else 'FAIL'}"
     )
@@ -150,10 +151,11 @@ def validate_bandwidth_original(
     lhs = (1.0 / dram_bandwidth_gbs) + (1.0 / nvme_bandwidth_gbs)
     rhs = 1.0 / compute_rate_gbs
     passes = lhs <= rhs
+    unicode_leq = '\u2264'
     explanation = (
         f"Original formula: 1/B_01 + 1/B_12 = 1/{dram_bandwidth_gbs:.1f} + "
         f"1/{nvme_bandwidth_gbs:.1f} = {lhs:.6f} "
-        f"{'\u2264' if passes else '>'} 1/Fcompute = {rhs:.6f}. "
+        f"{unicode_leq if passes else '>'} 1/Fcompute = {rhs:.6f}. "
         f"{'PASS' if passes else 'FAIL'}"
     )
     return passes, explanation

@@ -11,6 +11,6 @@ build/
 .ruff_cache/
 .pytest_cache/
 *.mmap
-.env
 .venv
 checkpoints/
+node_modules
