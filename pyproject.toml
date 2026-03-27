@@ -51,6 +51,7 @@ full = [
 ]
 dev = [
     "pytest>=7.0",
+    "pytest-timeout>=2.4.0",
     "pytest-asyncio",
     "ruff",
     "mypy",
