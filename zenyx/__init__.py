@@ -1,296 +1,88 @@
-"""Zenyx — A hardware-agnostic, self-managing distributed training runtime.
+"""ZENYX 2.0 — Phase 1 Foundation
 
-Never OOM. No config. GPU, TPU, CPU, AMD, Apple Silicon.
-1T params, 1M context, 500K vocab.
+A production-grade distributed LLM training runtime with:
+- Clean separation of concerns (runtime, distributed, memory, compiler)
+- FSDP-based distributed training
+- Selective activation checkpointing
+- Graph capture for future torch.compile integration
+- Offload policy framework
 
-Exports
--------
-- :func:`train` — single entry-point for training.
-- :class:`Trainer` — full-stack trainer class.
-- :func:`wrap` — wraps a model with Zenyx memory management.
-- :mod:`bench` — benchmarking utilities (memory budget, vs DeepSpeed).
-- :data:`offload_policy` — JAX checkpoint policy for host-DRAM activation
-  offloading. Pass to ``nn.remat(policy=offload_policy)`` to fix the
-  55 GB XLA HBM OOM on TPU v5 lite.
+Phase 1 is the foundation. Future phases will add:
+- Pipeline parallelism
+- Async execution overlap
+- Advanced memory tiering (NVMe, KV cache)
+- Advanced quantization (FP8, INT4)
 
 Usage::
 
-    import zenyx
+    import torch
+    import torch.nn as nn
+    from zenyx.distributed import FSDPWrapper
+    from zenyx.memory import ActivationManager
+    from zenyx.runtime import Scheduler
 
-    # Train a model — everything auto-configured
-    trainer = zenyx.train(model, dataloader, context_len=131072)
+    model = nn.TransformerEncoderLayer(d_model=768, nhead=12)
+    batch = torch.randn(32, 100, 768)
 
-    # Or wrap for manual control
-    model = zenyx.wrap(model)
+    # Wrap for distributed training
+    fsdp = FSDPWrapper(model, world_size=2, mixed_precision="fp16")
+    model = fsdp.wrap()
 
-    # JAX training: fix 55 GB OOM with one line
-    from zenyx import offload_policy
-    import flax.linen as nn
-    BlockRemat = nn.remat(Block, policy=offload_policy, prevent_cse=False)
+    # Add activation checkpointing
+    ActivationManager.hook_into_model(model, use_checkpoint=True)
+
+    # Set up training
+    optimizer = torch.optim.Adam(model.parameters())
+    scheduler = Scheduler(accumulation_steps=1)
+
+    # Training loop
+    output = scheduler.forward(model, batch)
+    loss = output.mean()
+    scheduler.backward(loss, optimizer)
 """
 
 from __future__ import annotations
 
-__version__ = "1.0.0"
+__version__ = "2.0.0-phase1"
+
 __all__ = [
     "__version__",
-    "Trainer",
-    "train",
-    "wrap",
-    "bench",
-    "auto_init_distributed",
-    "get_rank",
-    "get_world_size",
-    "is_main_process",
-    "barrier",
-    "ModelLoader",
-    "load_model",
-    # Phase 7: KV Cache Tiering
-    "BeladyKVCacheManager",
-    # Phase 8: FP8 KV Quantization
-    "quantize_kv_fp8",
-    "dequantize_kv",
-    "GradientMonitor",
-    # Phase 9: Dynamic Ring Curriculum
-    "RingCurriculumManager",
-    "CurriculumConfig",
-    # Phase 10: Sparse Ring Attention
-    "SparseRingAttentionKernel",
-    "compute_skip_schedule",
-    # JAX activation offloading (fixes 55 GB XLA HBM OOM)
-    "offload_policy",
+    # Runtime
+    "Scheduler",
+    "ExecutionPlan",
+    "ExecutionGraph",
+    "ExecutionGraphBuilder",
+    "OpNode",
+    "OpType",
+    # Distributed
+    "FSDPWrapper",
+    # Memory
+    "ActivationManager",
+    # Compiler
+    "OffloadManager",
+    "OffloadPolicy",
     "make_offload_policy",
-    "make_offload_remat",
+    # Utils
+    "setup_logging",
+    "get_logger",
 ]
 
 import logging
-import os
-from typing import TYPE_CHECKING, Any, Optional
 
 logger = logging.getLogger("zenyx")
 
-# ── Phase 4 imports ──────────────────────────────────────────────────────────────────────────
-
-from zenyx.train.trainer import Trainer
-from zenyx.train.trainer import train as _trainer_train
-from zenyx.train.distributed_setup import (
-    auto_init_distributed,
-    get_rank,
-    get_world_size,
-    is_main_process,
-    barrier,
+# Import all public components
+from zenyx.compiler import (
+    ExecutionGraph,
+    OffloadManager,
+    OffloadPolicy,
+    make_offload_policy,
 )
-from zenyx.loader.loader import ModelLoader, load_model
+from zenyx.distributed import FSDPWrapper
+from zenyx.memory import ActivationManager
+from zenyx.runtime import ExecutionGraphBuilder, ExecutionPlan, OpNode, Scheduler
+from zenyx.utils import get_logger, setup_logging
 
-# Convenience: auto-init distributed on import if env vars suggest it
-# but ONLY if ZENYX_AUTO_INIT_DISTRIBUTED=1 is set
-# (don't force init on every import — that breaks testing)
-if os.environ.get("ZENYX_AUTO_INIT_DISTRIBUTED", "0") == "1":
-    auto_init_distributed()
-
-
-def __getattr__(name: str) -> Any:
-    """Lazily import optional heavy / JAX-dependent symbols on first access."""
-    lazy_imports = {
-        "BeladyKVCacheManager": ("zenyx.train.kv_cache_tier", "BeladyKVCacheManager"),
-        "quantize_kv_fp8": ("zenyx.train.fp8_kv", "quantize_kv_fp8"),
-        "dequantize_kv": ("zenyx.train.fp8_kv", "dequantize_kv"),
-        "GradientMonitor": ("zenyx.train.fp8_kv", "GradientMonitor"),
-        "RingCurriculumManager": ("zenyx.train.ring_curriculum", "RingCurriculumManager"),
-        "CurriculumConfig": ("zenyx.train.ring_curriculum", "CurriculumConfig"),
-        "SparseRingAttentionKernel": (
-            "zenyx.ops.attention.sparse_ring_attn",
-            "SparseRingAttentionKernel",
-        ),
-        "compute_skip_schedule": (
-            "zenyx.ops.attention.sparse_ring_attn",
-            "compute_skip_schedule",
-        ),
-        "offload_policy": ("zenyx.ops.remat", "offload_policy"),
-        "make_offload_policy": ("zenyx.ops.remat", "make_offload_policy"),
-        "make_offload_remat": ("zenyx.ops.remat", "make_offload_remat"),
-    }
-
-    if name not in lazy_imports:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-    module_name, attr_name = lazy_imports[name]
-
-    if attr_name in {"offload_policy", "make_offload_policy", "make_offload_remat"}:
-        try:
-            module = __import__(module_name, fromlist=[attr_name])
-        except ImportError as exc:
-            raise ImportError(
-                "offload_policy requires JAX. Install with: pip install jax[cuda]"
-            ) from exc
-    else:
-        module = __import__(module_name, fromlist=[attr_name])
-
-    value = getattr(module, attr_name)
-    globals()[name] = value
-    return value
-
-# ── Lazy hardware detection ───────────────────────────────────────────────────────────
-
-_hardware_info: Optional[Any] = None
-
-
-def _auto_detect_hardware() -> Any:
-    """Lazily auto-detect hardware on first access.
-
-    Time: O(num_devices).  Space: O(1).
-    """
-    global _hardware_info  # noqa: PLW0603
-    if _hardware_info is None:
-        from zenyx.core.hal.detector import detect_hardware
-
-        _hardware_info = detect_hardware()
-        logger.debug("Zenyx auto-detected hardware: %s", _hardware_info)
-    return _hardware_info
-
-
-def hardware() -> Any:
-    """Return the detected hardware info. Lazily initialized.
-
-    Time: O(num_devices) on first call, O(1) thereafter.  Space: O(1).
-    """
-    return _auto_detect_hardware()
-
-
-# ── Public API ─────────────────────────────────────────────────────────────────────────
-
-
-def train(
-    model: Any,
-    dataloader: Any,
-    **kwargs: Any,
-) -> Trainer:
-    """Train a model — Zenyx handles everything else.
-
-    This is the single entry-point.  Zenyx will auto-detect hardware,
-    plan parallelism, manage memory across three tiers, and never OOM.
-
-    Creates a Trainer with the given model and dataloader, starts training,
-    and returns the Trainer for inspection.
-
-    Parameters
-    ----------
-    model : Any
-        A ``torch.nn.Module`` (or compatible).
-    dataloader : Any
-        An iterable of training batches.
-    **kwargs
-        Additional keyword arguments passed to :class:`Trainer`.
-
-    Returns
-    -------
-    Trainer
-        The trainer instance after training completes.
-
-    Example::
-
-        trainer = zenyx.train(model, dataloader, context_len=131072)
-        state = trainer.get_state()
-    """
-    return _trainer_train(model, dataloader, **kwargs)
-
-
-def wrap(model: Any) -> Any:
-    """Wrap a model with Zenyx memory management.
-
-    Hooks into forward / backward for activation checkpointing and
-    three-tier memory management.
-
-    Time: O(num_parameters).  Space: O(1) additional.
-
-    Parameters
-    ----------
-    model : Any
-        A ``torch.nn.Module``.
-
-    Returns
-    -------
-    Any
-        The same model, instrumented with Zenyx hooks.
-    """
-    _auto_detect_hardware()
-    logger.info("Zenyx v%s — wrapping model for memory management", __version__)
-
-    # Register forward/backward hooks for memory tracking
-    try:
-        import torch.nn as nn
-
-        if isinstance(model, nn.Module):
-            from zenyx.core.agent.profiler import AsyncProfiler
-
-            _profiler = AsyncProfiler(enabled=True)
-
-            def _forward_hook(
-                module: Any,
-                input: Any,
-                output: Any,
-            ) -> None:
-                pass  # Placeholder for activation checkpointing hooks
-
-            for name, module in model.named_modules():
-                module.register_forward_hook(_forward_hook)
-
-            # Attach profiler to model for external access
-            model._zenyx_profiler = _profiler  # type: ignore[attr-defined]
-    except ImportError:
-        logger.debug("PyTorch not available — wrap() is a no-op")
-
-    return model
-
-
-# ── bench module re-export ──────────────────────────────────────────────────────────────────────
-
-from zenyx import bench  # noqa: E402
-
-
-# ── Private helpers ──────────────────────────────────────────────────────────────────────
-
-
-def _count_params(model: Any) -> float:
-    """Count the number of trainable parameters in a model."""
-    try:
-        return float(sum(p.numel() for p in model.parameters()))
-    except (AttributeError, TypeError):
-        return 0.0
-
-
-def _infer_vocab_size(model: Any) -> int:
-    """Try to infer vocabulary size from common model attributes."""
-    for attr in ("config", "cfg"):
-        cfg = getattr(model, attr, None)
-        if cfg is not None:
-            for key in ("vocab_size", "n_vocab", "ntokens"):
-                val = getattr(cfg, key, None)
-                if val is not None:
-                    return int(val)
-    return 32000  # Sensible default
-
-
-def _infer_batch_size(dataloader: Any) -> int:
-    """Try to infer batch size from a dataloader."""
-    bs = getattr(dataloader, "batch_size", None)
-    if bs is not None:
-        return int(bs)
-    return 1
-
-
-def _map_hw_to_preset(hw: Any) -> Optional[str]:
-    """Map a HardwareInfo to a hardware preset name."""
-    name = getattr(hw, "device_name", "")
-    name_lower = name.lower()
-    if "h100" in name_lower:
-        return "H100"
-    if "h200" in name_lower:
-        return "H200"
-    if "a100" in name_lower:
-        return "A100"
-    if "4090" in name_lower:
-        return "RTX_4090"
-    if "tpu" in name_lower:
-        return "TPU_v5e"
-    return None
+# Set up default logging
+_logger = setup_logging(level=logging.INFO)
+logger = _logger
