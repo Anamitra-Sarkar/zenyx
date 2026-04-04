@@ -8,7 +8,7 @@ from zenyx.runtime.execution_graph import (
     OpNode,
     OpType,
 )
-from zenyx.runtime.scheduler import ExecutionPlan, Scheduler
+from zenyx.runtime.scheduler import ExecutionPlan, Scheduler, TopologyConfig
 from zenyx.runtime.validator import (
     GraphValidator,
     ValidationError,
@@ -23,6 +23,7 @@ __all__ = [
     "OpType",
     "Scheduler",
     "ExecutionPlan",
+    "TopologyConfig",
     "GraphValidator",
     "validate_graph",
     "ValidationError",
