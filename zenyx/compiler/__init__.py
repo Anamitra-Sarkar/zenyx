@@ -8,6 +8,11 @@ from zenyx.compiler.offload_policy import (
     OffloadPolicy,
     make_offload_policy,
 )
+from zenyx.compiler.xla_path import (
+    XLACheckpointPolicy,
+    maybe_offload_large_tensor,
+    remat_or_checkpoint,
+)
 
 __all__ = [
     "ExecutionGraph",
@@ -15,4 +20,7 @@ __all__ = [
     "OffloadPolicy",
     "OffloadManager",
     "make_offload_policy",
+    "XLACheckpointPolicy",
+    "remat_or_checkpoint",
+    "maybe_offload_large_tensor",
 ]

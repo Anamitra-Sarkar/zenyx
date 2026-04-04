@@ -1,18 +1,13 @@
-"""Forward and backward execution graph with dependencies.
+"""Forward/backward/communication execution graph primitives.
 
-This module defines the execution graph that represents:
-- Forward operations
-- Backward operations
-- Communication operations (all-reduce, broadcast)
-- Dependencies between them
-
-The graph is deterministic, traversable, and designed to be extended
-with async execution and communication overlap in future phases.
+The graph is a *strict DAG* and is used by the scheduler to drive execution
+based on dependency readiness (not list order).
 """
 
 from __future__ import annotations
 
 import logging
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Optional
@@ -24,34 +19,17 @@ logger = logging.getLogger(__name__)
 
 
 class OpType(Enum):
-    """Operation types in the execution graph."""
-
     FORWARD = "forward"
     BACKWARD = "backward"
     ALLREDUCE = "allreduce"
     BROADCAST = "broadcast"
     SYNC_PARAMS = "sync_params"
-    ACTIVATE = "activate"  # Restore activations from checkpoint
-    DEACTIVATE = "deactivate"  # Release activations
+    ACTIVATE = "activate"
+    DEACTIVATE = "deactivate"
 
 
 @dataclass
 class OpNode:
-    """Represents a single operation in the execution graph.
-
-    Attributes:
-        name: Unique operation identifier
-        op_type: Type of operation (from OpType enum)
-        inputs: List of input node names (dependencies)
-        outputs: List of output tensor names
-        module_name: Name of the module this operation belongs to
-        compute_time_ms: Estimated compute time in milliseconds
-        memory_bytes: Memory footprint of this operation
-        device_ids: List of device IDs participating in this operation
-        comm_group: Communication group info (for distributed ops)
-        metadata: Additional metadata (tensor shapes, etc.)
-    """
-
     name: str
     op_type: OpType
     inputs: list[str] = field(default_factory=list)
@@ -63,315 +41,159 @@ class OpNode:
     comm_group: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
-    def __hash__(self) -> int:
-        return hash(self.name)
-
-    def __eq__(self, other: Any) -> bool:
-        if not isinstance(other, OpNode):
-            return False
-        return self.name == other.name
-
-    def __repr__(self) -> str:
-        return f"OpNode({self.name}, {self.op_type.value})"
-
     @property
     def is_compute_op(self) -> bool:
-        """Check if this is a compute operation."""
         return self.op_type in (OpType.FORWARD, OpType.BACKWARD)
 
     @property
     def is_comm_op(self) -> bool:
-        """Check if this is a communication operation."""
         return self.op_type in (OpType.ALLREDUCE, OpType.BROADCAST, OpType.SYNC_PARAMS)
 
     @property
     def is_memory_op(self) -> bool:
-        """Check if this is a memory management operation."""
         return self.op_type in (OpType.ACTIVATE, OpType.DEACTIVATE)
 
 
 class ExecutionGraph:
-    """Represents the complete forward-backward execution graph.
-
-    The graph consists of:
-    - Forward nodes: in order of execution
-    - Backward nodes: in reverse topological order
-    - Communication nodes: all-reduce, parameter sync
-    - Memory nodes: activate/deactivate for checkpointing
-
-    The graph is deterministic and fully traversable.
-
-    Usage:
-        >>> graph = ExecutionGraph()
-        >>> graph.add_forward_node(node1)
-        >>> graph.add_backward_node(node2)
-        >>> forward_order = graph.get_forward_execution_order()
-        >>> backward_order = graph.get_backward_execution_order()
-    """
+    """Strict DAG for executable operations."""
 
     def __init__(self):
-        """Initialize empty execution graph."""
         self._forward_nodes: list[OpNode] = []
         self._backward_nodes: list[OpNode] = []
         self._all_nodes_by_name: dict[str, OpNode] = {}
-        self._dependencies: dict[str, list[str]] = {}  # node_name -> [dep_node_names]
-        self._node_counter = 0
+        self._dependencies: dict[str, list[str]] = {}
+        self._reverse_deps: dict[str, list[str]] = {}
+
+    def _register_node(self, node: OpNode) -> None:
+        if node.name in self._all_nodes_by_name:
+            raise ValueError(f"Duplicate node name: {node.name}")
+
+        self._all_nodes_by_name[node.name] = node
+        self._dependencies[node.name] = []
+        self._reverse_deps.setdefault(node.name, [])
+
+        for dep in node.inputs:
+            self.add_dependency(node.name, dep)
 
     def add_forward_node(self, node: OpNode) -> None:
-        """Add a forward operation node.
-
-        Parameters
-        ----------
-        node : OpNode
-            The forward operation node to add.
-        """
+        self._register_node(node)
         self._forward_nodes.append(node)
-        self._all_nodes_by_name[node.name] = node
-        self._dependencies[node.name] = node.inputs.copy()
-        logger.debug(f"Added forward node: {node.name}")
 
     def add_backward_node(self, node: OpNode) -> None:
-        """Add a backward operation node.
-
-        Parameters
-        ----------
-        node : OpNode
-            The backward operation node to add.
-        """
+        self._register_node(node)
         self._backward_nodes.append(node)
-        self._all_nodes_by_name[node.name] = node
-        self._dependencies[node.name] = node.inputs.copy()
-        logger.debug(f"Added backward node: {node.name}")
 
     def add_dependency(self, node_name: str, depends_on: str) -> None:
-        """Add a dependency between two nodes.
+        if node_name not in self._all_nodes_by_name:
+            raise KeyError(f"Unknown node: {node_name}")
+        if depends_on not in self._all_nodes_by_name:
+            raise KeyError(f"Dependency node does not exist: {depends_on}")
 
-        Parameters
-        ----------
-        node_name : str
-            The node that depends on another.
-        depends_on : str
-            The node it depends on.
-        """
-        if node_name not in self._dependencies:
-            self._dependencies[node_name] = []
+        deps = self._dependencies.setdefault(node_name, [])
+        if depends_on in deps:
+            return
 
-        if depends_on not in self._dependencies[node_name]:
-            self._dependencies[node_name].append(depends_on)
-            logger.debug(f"Added dependency: {node_name} <- {depends_on}")
+        deps.append(depends_on)
+        self._reverse_deps.setdefault(depends_on, []).append(node_name)
 
-    def get_forward_nodes(self) -> list[OpNode]:
-        """Get all forward operation nodes.
-
-        Returns
-        -------
-        list[OpNode]
-            Forward nodes in execution order.
-        """
-        return self._forward_nodes.copy()
-
-    def get_backward_nodes(self) -> list[OpNode]:
-        """Get all backward operation nodes.
-
-        Returns
-        -------
-        list[OpNode]
-            Backward nodes in execution order (reverse topological).
-        """
-        return self._backward_nodes.copy()
-
-    def get_forward_execution_order(self) -> list[OpNode]:
-        """Get forward nodes in correct execution order.
-
-        Returns
-        -------
-        list[OpNode]
-            Forward nodes topologically sorted by dependencies.
-        """
-        return self._topological_sort(self._forward_nodes)
-
-    def get_backward_execution_order(self) -> list[OpNode]:
-        """Get backward nodes in correct execution order.
-
-        Returns
-        -------
-        list[OpNode]
-            Backward nodes topologically sorted by dependencies.
-        """
-        return self._topological_sort(self._backward_nodes)
+        if self._has_cycle():
+            deps.remove(depends_on)
+            self._reverse_deps[depends_on].remove(node_name)
+            raise ValueError(f"Adding dependency {node_name} <- {depends_on} creates a cycle")
 
     def _topological_sort(self, nodes: list[OpNode]) -> list[OpNode]:
-        """Perform topological sort on nodes respecting dependencies.
+        node_set = {n.name for n in nodes}
+        indegree = {name: 0 for name in node_set}
 
-        Parameters
-        ----------
-        nodes : list[OpNode]
-            Nodes to sort.
+        for name in node_set:
+            for dep in self._dependencies.get(name, []):
+                if dep in node_set:
+                    indegree[name] += 1
 
-        Returns
-        -------
-        list[OpNode]
-            Topologically sorted nodes.
-        """
-        visited = set()
-        rec_stack = set()  # For cycle detection
-        sorted_nodes = []
-        has_cycle = False
-        cycle_path = []
+        ready = deque(sorted([n for n, d in indegree.items() if d == 0]))
+        ordered_names: list[str] = []
 
-        def visit(node: OpNode, path: list[str]) -> None:
-            nonlocal has_cycle, cycle_path
-            
-            if has_cycle:
-                return
-                
-            if node.name in rec_stack:
-                # Cycle detected
-                has_cycle = True
-                cycle_start = path.index(node.name) if node.name in path else len(path)
-                cycle_path = path[cycle_start:] + [node.name]
-                return
-                
-            if node.name in visited:
-                return
+        while ready:
+            current = ready.popleft()
+            ordered_names.append(current)
+            for nxt in self._reverse_deps.get(current, []):
+                if nxt not in indegree:
+                    continue
+                indegree[nxt] -= 1
+                if indegree[nxt] == 0:
+                    ready.append(nxt)
 
-            rec_stack.add(node.name)
-            path.append(node.name)
+        if len(ordered_names) != len(node_set):
+            raise ValueError("Cycle detected while topologically sorting graph")
 
-            # Visit dependencies first
-            for dep_name in self._dependencies.get(node.name, []):
-                if dep_name in self._all_nodes_by_name:
-                    visit(self._all_nodes_by_name[dep_name], path.copy())
+        by_name = {n.name: n for n in nodes}
+        return [by_name[name] for name in ordered_names]
 
-            rec_stack.remove(node.name)
-            
-            if not has_cycle:
-                visited.add(node.name)
-                sorted_nodes.append(node)
-
-        for node in nodes:
-            if node.name not in visited and not has_cycle:
-                visit(node, [])
-
-        if has_cycle:
-            logger.warning(f"Cycle detected during topological sort: {' -> '.join(cycle_path)}")
-            # Return partial order even with cycle - caller should check graph.validate()
-
-        return sorted_nodes
+    def _has_cycle(self) -> bool:
+        all_nodes = list(self._all_nodes_by_name.values())
+        if not all_nodes:
+            return False
+        try:
+            self._topological_sort(all_nodes)
+            return False
+        except ValueError:
+            return True
 
     def get_node(self, name: str) -> Optional[OpNode]:
-        """Get a node by name.
-
-        Parameters
-        ----------
-        name : str
-            Node name.
-
-        Returns
-        -------
-        Optional[OpNode]
-            The node, or None if not found.
-        """
         return self._all_nodes_by_name.get(name)
 
     def get_node_dependencies(self, node_name: str) -> list[str]:
-        """Get dependencies for a node.
-
-        Parameters
-        ----------
-        node_name : str
-            Node name.
-
-        Returns
-        -------
-        list[str]
-            Names of nodes this node depends on.
-        """
         return self._dependencies.get(node_name, []).copy()
 
+    def get_dependents(self, node_name: str) -> list[str]:
+        return self._reverse_deps.get(node_name, []).copy()
+
+    def get_forward_nodes(self) -> list[OpNode]:
+        return self._forward_nodes.copy()
+
+    def get_backward_nodes(self) -> list[OpNode]:
+        return self._backward_nodes.copy()
+
+    def get_all_nodes(self) -> list[OpNode]:
+        return list(self._all_nodes_by_name.values())
+
+    def get_forward_execution_order(self) -> list[OpNode]:
+        return self._topological_sort(self._forward_nodes)
+
+    def get_backward_execution_order(self) -> list[OpNode]:
+        return self._topological_sort(self._backward_nodes)
+
+    def validate(self) -> bool:
+        try:
+            self._topological_sort(self.get_all_nodes())
+        except ValueError:
+            return False
+
+        for node_name, deps in self._dependencies.items():
+            if node_name not in self._all_nodes_by_name:
+                return False
+            for dep in deps:
+                if dep not in self._all_nodes_by_name:
+                    return False
+        return True
+
     def summarize(self) -> dict[str, Any]:
-        """Summarize the execution graph.
-
-        Returns
-        -------
-        dict[str, Any]
-            Summary statistics.
-        """
-        all_nodes = self._forward_nodes + self._backward_nodes
-        total_compute = sum(node.compute_time_ms for node in all_nodes)
-        total_memory = sum(node.memory_bytes for node in all_nodes)
-
+        all_nodes = self.get_all_nodes()
         return {
             "num_forward_ops": len(self._forward_nodes),
             "num_backward_ops": len(self._backward_nodes),
             "total_ops": len(all_nodes),
-            "total_compute_ms": total_compute,
-            "total_memory_mb": total_memory / (1024 * 1024),
-            "num_dependencies": len(self._dependencies),
+            "total_compute_ms": sum(n.compute_time_ms for n in all_nodes),
+            "total_memory_mb": sum(n.memory_bytes for n in all_nodes) / (1024 * 1024),
+            "num_dependencies": sum(len(v) for v in self._dependencies.values()),
+            "is_dag": self.validate(),
         }
-
-    def validate(self) -> bool:
-        """Validate graph structure for correctness.
-
-        Returns
-        -------
-        bool
-            True if graph is valid.
-        """
-        # Check all dependencies exist
-        for node_name, deps in self._dependencies.items():
-            for dep in deps:
-                if dep not in self._all_nodes_by_name:
-                    logger.warning(
-                        f"Node {node_name} depends on non-existent node {dep}"
-                    )
-                    return False
-
-        # Check no cycles (simplified check)
-        visited = set()
-        rec_stack = set()
-
-        def has_cycle(node_name: str) -> bool:
-            visited.add(node_name)
-            rec_stack.add(node_name)
-
-            for dep in self._dependencies.get(node_name, []):
-                if dep not in visited:
-                    if has_cycle(dep):
-                        return True
-                elif dep in rec_stack:
-                    return True
-
-            rec_stack.remove(node_name)
-            return False
-
-        for node_name in self._all_nodes_by_name:
-            if node_name not in visited:
-                if has_cycle(node_name):
-                    logger.warning(f"Cycle detected in graph starting from {node_name}")
-                    return False
-
-        return True
 
 
 class ExecutionGraphBuilder:
-    """Builds execution graphs by tracing models.
-
-    This builder inspects a model and creates a complete execution graph
-    including forward nodes, backward nodes (implied by reversal), and
-    communication placeholders for distributed training.
-
-    Usage:
-        >>> builder = ExecutionGraphBuilder()
-        >>> graph = builder.build_from_model(model, sample_input, world_size=2)
-        >>> forward_order = graph.get_forward_execution_order()
-        >>> backward_order = graph.get_backward_execution_order()
-    """
+    """Build a conservative execution graph from a model trace."""
 
     def __init__(self):
-        """Initialize the graph builder."""
-        self._graph = ExecutionGraph()
-        self._module_names: list[str] = []
         self._node_counter = 0
 
     def build_from_model(
@@ -380,78 +202,28 @@ class ExecutionGraphBuilder:
         sample_input: torch.Tensor,
         world_size: int = 1,
     ) -> ExecutionGraph:
-        """Build execution graph by tracing model.
+        graph = ExecutionGraph()
 
-        Parameters
-        ----------
-        model : nn.Module
-            The model to trace.
-        sample_input : torch.Tensor
-            Sample input for tracing.
-        world_size : int
-            Number of distributed training processes. Default: 1 (single GPU).
+        leaf_modules: list[tuple[str, nn.Module]] = [
+            (name, module)
+            for name, module in model.named_modules()
+            if not list(module.children())
+        ]
 
-        Returns
-        -------
-        ExecutionGraph
-            The built execution graph.
-        """
-        logger.info(
-            f"Building execution graph from model (world_size={world_size})"
-        )
-
-        # Collect all leaf modules
-        leaf_modules = []
-        for name, module in model.named_modules():
-            if not list(module.children()):
-                leaf_modules.append((name, module))
-
-        # Build forward nodes by hooking into execution
-        forward_nodes_map: dict[str, OpNode] = {}
-        backward_nodes_map: dict[str, OpNode] = {}
+        execution_order: list[tuple[str, int, float]] = []
         hook_handles = []
 
         def make_forward_hook(module_name: str) -> Callable[..., None]:
-            def hook(module: nn.Module, input: Any, output: Any) -> None:
+            def hook(module: nn.Module, _input: Any, output: Any) -> None:
                 node_id = self._node_counter
                 self._node_counter += 1
-
-                # Calculate output size
-                output_size = self._estimate_tensor_size(output)
-
-                # Forward node
-                forward_node = OpNode(
-                    name=f"forward_{module_name}_{node_id}",
-                    op_type=OpType.FORWARD,
-                    module_name=module_name,
-                    memory_bytes=int(output_size),
-                    compute_time_ms=1.0,  # Placeholder
-                    metadata={"module": module_name, "order": node_id},
-                )
-
-                # Corresponding backward node (implicit)
-                backward_node = OpNode(
-                    name=f"backward_{module_name}_{node_id}",
-                    op_type=OpType.BACKWARD,
-                    module_name=module_name,
-                    memory_bytes=int(output_size),
-                    compute_time_ms=2.0,  # Backward typically ~2x
-                    metadata={"module": module_name, "order": node_id},
-                )
-
-                forward_nodes_map[forward_node.name] = forward_node
-                backward_nodes_map[backward_node.name] = backward_node
-                self._graph.add_forward_node(forward_node)
-                self._graph.add_backward_node(backward_node)
+                execution_order.append((module_name, node_id, self._estimate_tensor_size(output)))
 
             return hook
 
-        # Install hooks
         for name, module in leaf_modules:
-            hook = module.register_forward_hook(make_forward_hook(name))
-            hook_handles.append(hook)
+            hook_handles.append(module.register_forward_hook(make_forward_hook(name)))
 
-        # Trace forward pass
         try:
             with torch.no_grad():
                 _ = model(sample_input)
@@ -459,68 +231,65 @@ class ExecutionGraphBuilder:
             for hook in hook_handles:
                 hook.remove()
 
-        # Add communication nodes for distributed training
-        if world_size > 1:
-            self._add_communication_nodes(world_size)
+        prev_fwd: Optional[str] = None
+        backward_names: list[str] = []
+        for module_name, node_id, out_size in execution_order:
+            fwd_name = f"forward_{module_name}_{node_id}"
+            bwd_name = f"backward_{module_name}_{node_id}"
 
-        logger.info(
-            f"Built graph with {len(self._graph.get_forward_nodes())} "
-            f"forward and {len(self._graph.get_backward_nodes())} backward nodes"
-        )
+            fwd = OpNode(
+                name=fwd_name,
+                op_type=OpType.FORWARD,
+                module_name=module_name,
+                compute_time_ms=1.0,
+                memory_bytes=int(out_size),
+            )
+            graph.add_forward_node(fwd)
+            if prev_fwd is not None:
+                graph.add_dependency(fwd_name, prev_fwd)
+            prev_fwd = fwd_name
 
-        return self._graph
+            bwd = OpNode(
+                name=bwd_name,
+                op_type=OpType.BACKWARD,
+                module_name=module_name,
+                compute_time_ms=2.0,
+                memory_bytes=int(out_size),
+            )
+            graph.add_backward_node(bwd)
+            backward_names.append(bwd_name)
+
+        # Backward dependencies: reverse chain + each backward depends on its forward.
+        for idx in range(len(backward_names) - 1, -1, -1):
+            current = backward_names[idx]
+            forward_ref = current.replace("backward_", "forward_", 1)
+            if graph.get_node(forward_ref) is not None:
+                graph.add_dependency(current, forward_ref)
+            if idx < len(backward_names) - 1:
+                graph.add_dependency(current, backward_names[idx + 1])
+
+        if world_size > 1 and backward_names:
+            allreduce = OpNode(
+                name="allreduce_gradients",
+                op_type=OpType.ALLREDUCE,
+                compute_time_ms=10.0,
+                device_ids=list(range(world_size)),
+                comm_group={"world_size": world_size, "op": "sum", "bucketed": True},
+            )
+            graph.add_backward_node(allreduce)
+            for bwd_name in backward_names:
+                graph.add_dependency(allreduce.name, bwd_name)
+
+        if not graph.validate():
+            raise ValueError("Generated execution graph is invalid")
+        return graph
 
     def _estimate_tensor_size(self, tensor_or_tuple: Any) -> float:
-        """Estimate memory size of tensor(s).
-
-        Parameters
-        ----------
-        tensor_or_tuple : Any
-            A tensor or tuple of tensors.
-
-        Returns
-        -------
-        float
-            Size in bytes.
-        """
-        total_size = 0.0
-
         if isinstance(tensor_or_tuple, torch.Tensor):
-            total_size = float(tensor_or_tuple.element_size() * tensor_or_tuple.numel())
-        elif isinstance(tensor_or_tuple, (tuple, list)):
-            for item in tensor_or_tuple:
-                total_size += self._estimate_tensor_size(item)
-
-        return total_size
-
-    def _add_communication_nodes(self, world_size: int) -> None:
-        """Add communication nodes for distributed training.
-
-        These are actual communication operations that will be executed
-        by the scheduler.
-
-        Parameters
-        ----------
-        world_size : int
-            Number of processes.
-        """
-        # Add all-reduce node after backward (for gradient sync)
-        allreduce_node = OpNode(
-            name="allreduce_gradients",
-            op_type=OpType.ALLREDUCE,
-            compute_time_ms=10.0,  # Placeholder estimate
-            device_ids=list(range(world_size)),
-            comm_group={"world_size": world_size, "op": "sum"},
-            metadata={"purpose": "gradient_synchronization"},
-        )
-        self._graph.add_backward_node(allreduce_node)
-
-        # Make all-reduce depend on all backward compute nodes
-        for backward_node in self._graph.get_backward_nodes()[:-1]:  # Exclude allreduce itself
-            if backward_node.op_type == OpType.BACKWARD:
-                self._graph.add_dependency("allreduce_gradients", backward_node.name)
-
-        logger.debug(f"Added communication nodes for world_size={world_size}")
+            return float(tensor_or_tuple.element_size() * tensor_or_tuple.numel())
+        if isinstance(tensor_or_tuple, (tuple, list)):
+            return float(sum(self._estimate_tensor_size(item) for item in tensor_or_tuple))
+        return 0.0
 
 
 __all__ = ["ExecutionGraph", "ExecutionGraphBuilder", "OpNode", "OpType"]
