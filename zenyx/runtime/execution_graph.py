@@ -3,8 +3,8 @@
 This module defines the execution graph that represents:
 - Forward operations
 - Backward operations
+- Communication operations (all-reduce, broadcast)
 - Dependencies between them
-- Communication placeholders (all-reduce, parameter sync)
 
 The graph is deterministic, traversable, and designed to be extended
 with async execution and communication overlap in future phases.
@@ -29,6 +29,7 @@ class OpType(Enum):
     FORWARD = "forward"
     BACKWARD = "backward"
     ALLREDUCE = "allreduce"
+    BROADCAST = "broadcast"
     SYNC_PARAMS = "sync_params"
     ACTIVATE = "activate"  # Restore activations from checkpoint
     DEACTIVATE = "deactivate"  # Release activations
@@ -46,6 +47,8 @@ class OpNode:
         module_name: Name of the module this operation belongs to
         compute_time_ms: Estimated compute time in milliseconds
         memory_bytes: Memory footprint of this operation
+        device_ids: List of device IDs participating in this operation
+        comm_group: Communication group info (for distributed ops)
         metadata: Additional metadata (tensor shapes, etc.)
     """
 
@@ -56,6 +59,8 @@ class OpNode:
     module_name: str = ""
     compute_time_ms: float = 0.0
     memory_bytes: int = 0
+    device_ids: list[int] = field(default_factory=list)
+    comm_group: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __hash__(self) -> int:
@@ -68,6 +73,21 @@ class OpNode:
 
     def __repr__(self) -> str:
         return f"OpNode({self.name}, {self.op_type.value})"
+
+    @property
+    def is_compute_op(self) -> bool:
+        """Check if this is a compute operation."""
+        return self.op_type in (OpType.FORWARD, OpType.BACKWARD)
+
+    @property
+    def is_comm_op(self) -> bool:
+        """Check if this is a communication operation."""
+        return self.op_type in (OpType.ALLREDUCE, OpType.BROADCAST, OpType.SYNC_PARAMS)
+
+    @property
+    def is_memory_op(self) -> bool:
+        """Check if this is a memory management operation."""
+        return self.op_type in (OpType.ACTIVATE, OpType.DEACTIVATE)
 
 
 class ExecutionGraph:
@@ -194,22 +214,48 @@ class ExecutionGraph:
             Topologically sorted nodes.
         """
         visited = set()
+        rec_stack = set()  # For cycle detection
         sorted_nodes = []
+        has_cycle = False
+        cycle_path = []
 
-        def visit(node: OpNode) -> None:
+        def visit(node: OpNode, path: list[str]) -> None:
+            nonlocal has_cycle, cycle_path
+            
+            if has_cycle:
+                return
+                
+            if node.name in rec_stack:
+                # Cycle detected
+                has_cycle = True
+                cycle_start = path.index(node.name) if node.name in path else len(path)
+                cycle_path = path[cycle_start:] + [node.name]
+                return
+                
             if node.name in visited:
                 return
+
+            rec_stack.add(node.name)
+            path.append(node.name)
 
             # Visit dependencies first
             for dep_name in self._dependencies.get(node.name, []):
                 if dep_name in self._all_nodes_by_name:
-                    visit(self._all_nodes_by_name[dep_name])
+                    visit(self._all_nodes_by_name[dep_name], path.copy())
 
-            visited.add(node.name)
-            sorted_nodes.append(node)
+            rec_stack.remove(node.name)
+            
+            if not has_cycle:
+                visited.add(node.name)
+                sorted_nodes.append(node)
 
         for node in nodes:
-            visit(node)
+            if node.name not in visited and not has_cycle:
+                visit(node, [])
+
+        if has_cycle:
+            logger.warning(f"Cycle detected during topological sort: {' -> '.join(cycle_path)}")
+            # Return partial order even with cycle - caller should check graph.validate()
 
         return sorted_nodes
 
@@ -448,28 +494,31 @@ class ExecutionGraphBuilder:
         return total_size
 
     def _add_communication_nodes(self, world_size: int) -> None:
-        """Add communication placeholder nodes for distributed training.
+        """Add communication nodes for distributed training.
 
-        In Phase 2, these are placeholders. Phase 3 will implement actual
-        all-reduce and parameter sync operations.
+        These are actual communication operations that will be executed
+        by the scheduler.
 
         Parameters
         ----------
         world_size : int
             Number of processes.
         """
-        # Add all-reduce node after backward
+        # Add all-reduce node after backward (for gradient sync)
         allreduce_node = OpNode(
             name="allreduce_gradients",
             op_type=OpType.ALLREDUCE,
-            compute_time_ms=10.0,  # Placeholder
-            metadata={"world_size": world_size},
+            compute_time_ms=10.0,  # Placeholder estimate
+            device_ids=list(range(world_size)),
+            comm_group={"world_size": world_size, "op": "sum"},
+            metadata={"purpose": "gradient_synchronization"},
         )
         self._graph.add_backward_node(allreduce_node)
 
-        # Make all-reduce depend on all backward nodes
-        for backward_node in self._graph.get_backward_nodes()[:-1]:  # Exclude allreduce
-            self._graph.add_dependency("allreduce_gradients", backward_node.name)
+        # Make all-reduce depend on all backward compute nodes
+        for backward_node in self._graph.get_backward_nodes()[:-1]:  # Exclude allreduce itself
+            if backward_node.op_type == OpType.BACKWARD:
+                self._graph.add_dependency("allreduce_gradients", backward_node.name)
 
         logger.debug(f"Added communication nodes for world_size={world_size}")
 

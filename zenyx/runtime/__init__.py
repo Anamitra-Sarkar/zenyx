@@ -1,4 +1,4 @@
-"""Runtime subsystem — execution graph and scheduling."""
+"""Runtime subsystem — execution graph, scheduling, and validation."""
 
 from __future__ import annotations
 
@@ -9,6 +9,12 @@ from zenyx.runtime.execution_graph import (
     OpType,
 )
 from zenyx.runtime.scheduler import ExecutionPlan, Scheduler
+from zenyx.runtime.validator import (
+    GraphValidator,
+    ValidationError,
+    ValidationResult,
+    validate_graph,
+)
 
 __all__ = [
     "ExecutionGraph",
@@ -17,4 +23,8 @@ __all__ = [
     "OpType",
     "Scheduler",
     "ExecutionPlan",
+    "GraphValidator",
+    "validate_graph",
+    "ValidationError",
+    "ValidationResult",
 ]
